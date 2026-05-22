@@ -812,10 +812,11 @@ class App:
         self.log_txt.see("end"); self.log_txt.config(state="disabled")
 
     # ── Feed ─────────────────────────────────────────────────────
-    PARA_MIN_SENTENCES = 2    # flush when ≥2 complete sentences pile up
-    PARA_SILENCE_SEC   = 2.5  # flush after this many seconds of silence
-    PARA_SILENCE_MID   = 1.5  # shorter wait when a sentence is already complete
-    PARA_MAX_WORDS     = 80   # hard word-count cap regardless of sentences
+    PARA_MIN_SENTENCES = 4    # need 4 complete sentences before even considering a flush
+    PARA_MIN_WORDS     = 30   # AND at least 30 words — kills "You're." solo flushes
+    PARA_SILENCE_SEC   = 4.5  # true paragraph break = 4.5s of silence
+    PARA_SILENCE_MID   = 3.5  # still long — speakers pause between sentences naturally
+    PARA_MAX_WORDS     = 120  # hard cap raised so long thoughts stay together
 
     def _handle(self,p):
         self.live_cap.config(text=p.text+("  ▋" if p.partial else ""),
@@ -875,7 +876,7 @@ class App:
         ends    = bool(re.search(r'[.!?](\s|$)', self._para_text))
         n_sents = len([s for s in re.split(r'[.!?]+', self._para_text) if s.strip()])
 
-        if ends and n_sents >= self.PARA_MIN_SENTENCES:
+        if ends and n_sents >= self.PARA_MIN_SENTENCES and words >= self.PARA_MIN_WORDS:
             self._para_flush()
         elif words >= self.PARA_MAX_WORDS:
             self._para_flush()
