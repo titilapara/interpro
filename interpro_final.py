@@ -395,6 +395,7 @@ class App:
         self.seg_count=0; self.word_count=0; self._last_meter=0.0
         self._para_text=""; self._para_trans=""; self._para_lang="en"
         self._para_conf=0.0; self._para_ts=None; self._para_timer=None
+        self._para_lock=threading.Lock(); self._pending_dev=None
 
         # Core
         self.ui_q=queue.Queue(maxsize=500)
@@ -670,40 +671,45 @@ class App:
         self.rec_btn.config(state="disabled",text="Connecting...")
         self.pipe_lbl.config(text="Connecting to Deepgram...",fg=YELLOW)
         self.hdr_status.config(text="Connecting...",fg=YELLOW)
-        self.root.update()
 
-        # Connect in background thread
+        # Connect in background — _poll handles connect_result so the UI stays live
         self._dg=DeepgramStream(api_key,self.ui_q,self.translator,self.log)
-        result=[False]
-        def do_connect(): result[0]=self._dg.connect(lang_hint=hint)
-        t=threading.Thread(target=do_connect,daemon=True); t.start(); t.join(timeout=12)
+        self._pending_dev=dev
+        threading.Thread(target=self._do_connect,args=(self._dg,hint),daemon=True).start()
 
-        self.rec_btn.config(state="normal")
-        if not result[0]:
-            self.rec_btn.config(text="⏺   Start Recording",bg=BG4,fg=TEXT)
-            self.pipe_lbl.config(text="Connection failed — check Debug log",fg=RED)
-            self.hdr_status.config(text="Connection failed",fg=RED)
-            messagebox.showerror("Connection Failed",
-                "Could not connect to Deepgram.\n\nSee the Debug panel for the exact error.\n\n"
-                "The URL being used is logged there.")
-            return
+    def _do_connect(self,dg,hint):
+        ok=dg.connect(lang_hint=hint)
+        try: self.ui_q.put_nowait(("connect_result",ok))
+        except: pass
 
-        # Start audio
+    def _finish_start(self):
+        dev=self._pending_dev
         self._cap=AudioCapture(dev["index"],self._on_chunk,self._on_level,self.log)
         try: dev_name=self._cap.start()
         except Exception as e:
             self.log.log(f"Audio start failed: {e}","ERROR")
             self._dg.stop()
+            self.rec_btn.config(state="normal",text="⏺   Start Recording",bg=BG4,fg=TEXT)
+            self.pipe_lbl.config(text="Audio error — check Debug log",fg=RED)
+            self.hdr_status.config(text="Audio error",fg=RED)
             messagebox.showerror("Audio Error",f"{e}\n\nSet CABLE Input as Default Playback."); return
 
         self.recording=True; self.session_start=time.time()
-        self.rec_btn.config(text="⏹   Stop Recording",bg=ACCENT,fg=BG)
+        self.rec_btn.config(state="normal",text="⏹   Stop Recording",bg=ACCENT,fg=BG)
         self.rec_lbl.config(text=f"● {dev_name}",fg=ACCENT)
         self.live_dot.config(fg=ACCENT)
         self.live_cap.config(text="Listening…",fg=DIM)
         self.eng_lbl.config(text="Deepgram Nova-2",fg=DIM)
         self.pipe_lbl.config(text="✓ Streaming to Deepgram",fg=GREEN)
         self.hdr_status.config(text="Recording",fg=GREEN)
+
+    def _connect_failed(self):
+        self.rec_btn.config(state="normal",text="⏺   Start Recording",bg=BG4,fg=TEXT)
+        self.pipe_lbl.config(text="Connection failed — check Debug log",fg=RED)
+        self.hdr_status.config(text="Connection failed",fg=RED)
+        messagebox.showerror("Connection Failed",
+            "Could not connect to Deepgram.\n\nSee the Debug panel for the exact error.\n\n"
+            "The URL being used is logged there.")
 
     def _stop(self):
         self.recording=False
@@ -742,6 +748,10 @@ class App:
                     if self._dg:
                         self.d_sent.config(text=f"{self._dg._bytes_sent/1024:.1f} KB")
                         self.d_msgs.config(text=str(self._dg._msgs_recv))
+                elif k=="connect_result":
+                    _,ok=item
+                    if ok: self._finish_start()
+                    else: self._connect_failed()
                 elif k=="phrase": self._handle(item[1])
                 elif k=="flush_para": self._para_flush()
                 elif k=="ws_status":
@@ -818,7 +828,6 @@ class App:
         if self.autoscroll.get(): self.feed.see("end")
 
     def _para_add(self, p):
-        import threading
         new_text  = p.text.strip()
         new_trans = (p.translation or "").strip()
 
@@ -871,16 +880,17 @@ class App:
         except: pass
 
     def _para_flush(self):
-        if not self._para_text.strip(): return
-        if self._para_timer:
-            self._para_timer.cancel(); self._para_timer = None
+        with self._para_lock:
+            if not self._para_text.strip(): return
+            if self._para_timer:
+                self._para_timer.cancel(); self._para_timer = None
+            text=self._para_text.strip(); trans=self._para_trans.strip()
+            lang=self._para_lang; conf=self._para_conf; ts=self._para_ts or time.time()
+            self._para_text=""; self._para_trans=""
+            self._para_conf=0.0; self._para_ts=None
         p = Phrase(id=f"para_{self.seg_count:04d}",
-                   text=self._para_text.strip(),
-                   translation=self._para_trans.strip(),
-                   lang=self._para_lang, conf=self._para_conf,
-                   ts=self._para_ts or time.time(), partial=False)
-        self._para_text=""; self._para_trans=""
-        self._para_conf=0.0; self._para_ts=None
+                   text=text, translation=trans,
+                   lang=lang, conf=conf, ts=ts, partial=False)
         self._append(p)
         if self.autoscroll.get(): self.feed.see("end")
 
@@ -919,7 +929,7 @@ class App:
             lines.append(f"[{ts}] [{p.lang.upper()}]  {p.text}")
             if p.translation: lines.append(f"             -> {p.translation}")
             lines.append("")
-        open(path,"w",encoding="utf-8").write("\n".join(lines))
+        with open(path,"w",encoding="utf-8") as f: f.write("\n".join(lines))
         messagebox.showinfo("Exported",f"Saved:\n{path}")
 
     def _clear(self):
