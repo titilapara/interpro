@@ -25,10 +25,14 @@ VBCABLE_KW  = ["cable output","cable-b","cable-c","cable-d","vb-audio",
                "voicemeeter output","voicemeeter aux","voicemeeter vaio"]
 LOOPBACK_KW = ["stereo mix","loopback","what u hear","wave out","mixage","mezcla","monitor of"]
 
-# ── Colours ──────────────────────────────────────────────────────
-BG="#090d13"; BG2="#0d1117"; BG3="#131922"; BG4="#1a2232"; BORDER="#1e2a3a"
-ACCENT="#00c8ff"; GREEN="#3ddc84"; YELLOW="#f5a623"; RED="#ff5f56"
-TEXT="#e2e8f0"; DIM="#64748b"; MUT="#334155"; PURPLE="#b388ff"
+# ── Palette ──────────────────────────────────────────────────────
+BG="#07080f"; BG2="#0d1019"; BG3="#111723"; BG4="#181f2e"; BORDER="#1b2438"
+ACCENT="#5b6ef5"; GREEN="#22d3a0"; YELLOW="#f5c542"; RED="#f04f4f"
+TEXT="#e8ecff"; DIM="#4e5f80"; MUT="#172032"; PURPLE="#9b87f5"
+
+# ── Typography ───────────────────────────────────────────────────
+F  = "Segoe UI"   # clean system font on all Windows 10/11 machines
+FM = "Consolas"   # monospace for timestamps / debug log
 
 # ── Data ─────────────────────────────────────────────────────────
 @dataclass
@@ -418,7 +422,7 @@ class App:
         self.show_tr=tk.BooleanVar(value=True)
         self.autoscroll=tk.BooleanVar(value=True)
         self.font_size=tk.IntVar(value=14)
-        self.show_debug=tk.BooleanVar(value=True)  # ON by default so user can see logs
+        self.show_debug=tk.BooleanVar(value=False)
 
         self._build()
         self._load_devices()
@@ -436,180 +440,170 @@ class App:
 
     # ── UI ──────────────────────────────────────────────────────
     def _build(self):
-        # Header
-        hdr=tk.Frame(self.root,bg=BG2,height=56); hdr.pack(fill="x"); hdr.pack_propagate(False)
+        self.root.title("InterPro")
+        # ── Header ──────────────────────────────────────────────
+        hdr=tk.Frame(self.root,bg=BG2,height=54); hdr.pack(fill="x"); hdr.pack_propagate(False)
         tk.Frame(self.root,bg=BORDER,height=1).pack(fill="x")
-        tk.Label(hdr,text="◈  InterPro",bg=BG2,fg=ACCENT,font=("Helvetica",17,"bold")).pack(side="left",padx=20)
-        lf=tk.Frame(hdr,bg=ACCENT,padx=7,pady=3); lf.pack(side="left",pady=18)
-        tk.Label(lf,text="LIVE",bg=ACCENT,fg=BG,font=("Helvetica",8,"bold")).pack()
-        self.eng_lbl=tk.Label(hdr,text="",bg=BG2,fg=DIM,font=("Helvetica",9)); self.eng_lbl.pack(side="left",padx=14)
+        tk.Label(hdr,text="InterPro",bg=BG2,fg=TEXT,font=(F,15,"bold")).pack(side="left",padx=(22,0))
+        badge=tk.Frame(hdr,bg=ACCENT,padx=7,pady=2); badge.pack(side="left",padx=9,pady=19)
+        tk.Label(badge,text="PRO",bg=ACCENT,fg="white",font=(F,7,"bold")).pack()
+        self.eng_lbl=tk.Label(hdr,text="",bg=BG2,fg=DIM,font=(F,9)); self.eng_lbl.pack(side="left",padx=10)
         tk.Checkbutton(hdr,text="Debug",variable=self.show_debug,bg=BG2,fg=DIM,
-            selectcolor=BG3,activebackground=BG2,font=("Helvetica",9),
-            command=self._toggle_debug).pack(side="right",padx=8)
-        self.hdr_status=tk.Label(hdr,text="Ready",bg=BG2,fg=DIM,font=("Helvetica",10))
-        self.hdr_status.pack(side="right",padx=20)
-
-        # Body
+            selectcolor=BG3,activebackground=BG2,font=(F,9),
+            command=self._toggle_debug).pack(side="right",padx=(0,20))
+        self.hdr_status=tk.Label(hdr,text="Ready",bg=BG2,fg=DIM,font=(F,9))
+        self.hdr_status.pack(side="right",padx=6)
+        # ── Body ────────────────────────────────────────────────
         body=tk.Frame(self.root,bg=BG); body.pack(fill="both",expand=True)
-        sb=tk.Frame(body,bg=BG2,width=280); sb.pack(side="left",fill="y"); sb.pack_propagate(False)
+        sb=tk.Frame(body,bg=BG2,width=264); sb.pack(side="left",fill="y"); sb.pack_propagate(False)
         tk.Frame(body,bg=BORDER,width=1).pack(side="left",fill="y")
         self._build_sb(sb)
         mid=tk.Frame(body,bg=BG); mid.pack(side="left",fill="both",expand=True)
         self._build_mid(mid)
-        self.dbg_frame=tk.Frame(body,bg=BG2,width=360); self.dbg_frame.pack_propagate(False)
+        self.dbg_frame=tk.Frame(body,bg=BG2,width=340); self.dbg_frame.pack_propagate(False)
         self._build_dbg(self.dbg_frame)
         if self.show_debug.get(): self.dbg_frame.pack(side="right",fill="y")
 
     def _build_sb(self,sb):
-        p=dict(padx=16)
-        # Record btn
-        rw=tk.Frame(sb,bg=BG2); rw.pack(fill="x",pady=(20,0),**p)
-        self.rec_btn=tk.Button(rw,text="⏺   Start Recording",bg=BG4,fg=TEXT,
-            relief="flat",font=("Helvetica",12,"bold"),activebackground=ACCENT,
-            activeforeground=BG,cursor="hand2",pady=12,bd=0,command=self._toggle)
+        px=dict(padx=18)
+        # ── Record button ────────────────────────────────────────
+        rw=tk.Frame(sb,bg=BG2); rw.pack(fill="x",pady=(22,0),**px)
+        self.rec_btn=tk.Button(rw,text="⏺  Start Listening",bg=ACCENT,fg="white",
+            relief="flat",font=(F,11,"bold"),activebackground="#4a5de0",
+            activeforeground="white",cursor="hand2",pady=14,bd=0,command=self._toggle)
         self.rec_btn.pack(fill="x")
-        self.rec_lbl=tk.Label(rw,text="Ready",bg=BG2,fg=DIM,font=("Helvetica",9))
-        self.rec_lbl.pack(pady=(5,0))
+        self.rec_lbl=tk.Label(rw,text="Ready",bg=BG2,fg=DIM,font=(F,8))
+        self.rec_lbl.pack(pady=(6,0))
         self._div(sb)
-
-        # API Key
-        self._sec(sb,"DEEPGRAM API KEY")
-        aw=tk.Frame(sb,bg=BG2); aw.pack(fill="x",**p)
-        kr=tk.Frame(aw,bg=BG2); kr.pack(fill="x")
+        # ── API Key ──────────────────────────────────────────────
+        self._sec(sb,"API KEY")
+        aw=tk.Frame(sb,bg=BG2); aw.pack(fill="x",**px)
+        kr=tk.Frame(aw,bg=BG3); kr.pack(fill="x")
         self.key_entry=tk.Entry(kr,textvariable=self.api_key_var,bg=BG3,fg=TEXT,
-            insertbackground=ACCENT,relief="flat",font=("Helvetica",9),show="*")
-        self.key_entry.pack(side="left",fill="x",expand=True,ipady=5)
-        tk.Button(kr,text="Save",bg=BG4,fg=ACCENT,relief="flat",font=("Helvetica",8),
-            cursor="hand2",padx=8,command=self._save_key).pack(side="left",padx=(4,0))
-        tk.Label(aw,text="console.deepgram.com",bg=BG2,fg=MUT,font=("Helvetica",8)).pack(anchor="w",pady=(2,0))
+            insertbackground=ACCENT,relief="flat",font=(F,9),show="●",bd=0)
+        self.key_entry.pack(side="left",fill="x",expand=True,ipady=7,padx=(10,0))
+        tk.Button(kr,text="Save",bg=BG3,fg=ACCENT,relief="flat",font=(F,8,"bold"),
+            cursor="hand2",padx=10,pady=7,activebackground=BG4,
+            bd=0,command=self._save_key).pack(side="left")
+        tk.Label(aw,text="console.deepgram.com",bg=BG2,fg=DIM,font=(F,8)).pack(anchor="w",pady=(5,0))
         self._div(sb)
-
-        # Device
+        # ── Device ───────────────────────────────────────────────
         self._sec(sb,"AUDIO SOURCE")
-        dw=tk.Frame(sb,bg=BG2); dw.pack(fill="x",**p)
+        dw=tk.Frame(sb,bg=BG2); dw.pack(fill="x",**px)
         style=ttk.Style(); style.theme_use("clam")
         style.configure("IP.TCombobox",fieldbackground=BG3,background=BG3,
             foreground=TEXT,bordercolor=BORDER,arrowcolor=DIM,
-            selectbackground=BG4,selectforeground=TEXT)
+            selectbackground=BG4,selectforeground=TEXT,padding=(8,6))
         style.map("IP.TCombobox",fieldbackground=[("readonly",BG3)],foreground=[("readonly",TEXT)])
         self.dev_combo=ttk.Combobox(dw,textvariable=self.dev_var,state="readonly",
-            style="IP.TCombobox",font=("Helvetica",9))
+            style="IP.TCombobox",font=(F,9))
         self.dev_combo.pack(fill="x"); self.dev_combo.bind("<<ComboboxSelected>>",self._on_dev)
-        self.dev_lbl=tk.Label(dw,text="Scanning...",bg=BG2,fg=ACCENT,
-            font=("Helvetica",8),wraplength=240,justify="left")
-        self.dev_lbl.pack(anchor="w",pady=(4,0))
+        self.dev_lbl=tk.Label(dw,text="Scanning…",bg=BG2,fg=GREEN,
+            font=(F,8),wraplength=228,justify="left")
+        self.dev_lbl.pack(anchor="w",pady=(5,0))
         self._div(sb)
-
-        # Language
+        # ── Direction ────────────────────────────────────────────
         self._sec(sb,"DIRECTION")
-        lw=tk.Frame(sb,bg=BG2); lw.pack(fill="x",**p)
-        for v,l in [("auto","Auto EN ↔ ES"),("en","English → Spanish"),("es","Spanish → English")]:
+        lw=tk.Frame(sb,bg=BG2); lw.pack(fill="x",**px)
+        for v,l in [("auto","Auto  EN ↔ ES"),("en","English → Spanish"),("es","Spanish → English")]:
             tk.Radiobutton(lw,text=l,variable=self.lang_var,value=v,bg=BG2,fg=DIM,
-                selectcolor=BG3,activebackground=BG2,activeforeground=TEXT,
-                font=("Helvetica",9)).pack(anchor="w",pady=1)
+                selectcolor=BG4,activebackground=BG2,activeforeground=TEXT,
+                font=(F,9)).pack(anchor="w",pady=3)
         self._div(sb)
-
-        # Meter
-        self._sec(sb,"AUDIO LEVEL")
-        mw=tk.Frame(sb,bg=BG2); mw.pack(fill="x",**p)
-        mbg=tk.Frame(mw,bg=BG4,height=10); mbg.pack(fill="x"); mbg.pack_propagate(False)
-        self.meter=tk.Frame(mbg,bg=GREEN,height=10); self.meter.place(x=0,y=0,relheight=1,relwidth=0)
-        self.meter_lbl=tk.Label(mw,text="○ Standby",bg=BG2,fg=DIM,font=("Helvetica",8))
-        self.meter_lbl.pack(anchor="w",pady=(4,0))
-        self.bytes_lbl=tk.Label(mw,text="0 KB captured",bg=BG2,fg=MUT,font=("Helvetica",8))
+        # ── Audio meter ──────────────────────────────────────────
+        self._sec(sb,"INPUT LEVEL")
+        mw=tk.Frame(sb,bg=BG2); mw.pack(fill="x",**px)
+        mbg=tk.Frame(mw,bg=BG4,height=5); mbg.pack(fill="x"); mbg.pack_propagate(False)
+        self.meter=tk.Frame(mbg,bg=GREEN,height=5); self.meter.place(x=0,y=0,relheight=1,relwidth=0)
+        self.meter_lbl=tk.Label(mw,text="Standby",bg=BG2,fg=DIM,font=(F,8))
+        self.meter_lbl.pack(anchor="w",pady=(5,0))
+        self.bytes_lbl=tk.Label(mw,text="",bg=BG2,fg=DIM,font=(F,8))
         self.bytes_lbl.pack(anchor="w")
         self._div(sb)
-
-        # Stats
+        # ── Session stats ─────────────────────────────────────────
         self._sec(sb,"SESSION")
-        sw=tk.Frame(sb,bg=BG2); sw.pack(fill="x",**p)
+        sw=tk.Frame(sb,bg=BG2); sw.pack(fill="x",**px)
         sw.columnconfigure(0,weight=1); sw.columnconfigure(1,weight=1)
         self.sv_time=self._stat(sw,"0:00","Duration",0,0)
         self.sv_words=self._stat(sw,"0","Words",0,1)
-        self.sv_segs=self._stat(sw,"0","Segments",1,0)
+        self.sv_segs=self._stat(sw,"0","Paragraphs",1,0)
         self.sv_lang=self._stat(sw,"—","Language",1,1)
         self._div(sb)
-
-        # Pipeline
+        # ── Status ───────────────────────────────────────────────
         self._sec(sb,"STATUS")
-        self.pipe_lbl=tk.Label(sb,text="Idle",bg=BG2,fg=DIM,font=("Helvetica",9),wraplength=248,justify="left")
-        self.pipe_lbl.pack(anchor="w",padx=16)
-
-        # Bottom
-        btn=tk.Frame(sb,bg=BG2); btn.pack(side="bottom",fill="x",padx=16,pady=14)
-        tk.Checkbutton(btn,text="Show translation",variable=self.show_tr,bg=BG2,fg=DIM,
-            selectcolor=BG3,activebackground=BG2,font=("Helvetica",9),
-            command=self._rebuild).pack(anchor="w")
-        tk.Checkbutton(btn,text="Auto-scroll",variable=self.autoscroll,bg=BG2,fg=DIM,
-            selectcolor=BG3,activebackground=BG2,font=("Helvetica",9)).pack(anchor="w")
-        tk.Button(btn,text="Export",bg=BG4,fg=TEXT,relief="flat",font=("Helvetica",9),
-            cursor="hand2",pady=6,command=self._export).pack(fill="x",pady=(8,4))
-        tk.Button(btn,text="Clear",bg=BG4,fg=DIM,relief="flat",font=("Helvetica",9),
-            cursor="hand2",pady=6,command=self._clear).pack(fill="x")
+        self.pipe_lbl=tk.Label(sb,text="Idle",bg=BG2,fg=DIM,font=(F,9),wraplength=240,justify="left")
+        self.pipe_lbl.pack(anchor="w",padx=18,pady=(0,6))
+        # ── Bottom controls ───────────────────────────────────────
+        bot=tk.Frame(sb,bg=BG2); bot.pack(side="bottom",fill="x",padx=18,pady=18)
+        opts=tk.Frame(bot,bg=BG2); opts.pack(fill="x",pady=(0,12))
+        tk.Checkbutton(opts,text="Show translation",variable=self.show_tr,bg=BG2,fg=DIM,
+            selectcolor=BG4,activebackground=BG2,font=(F,9),
+            command=self._rebuild).pack(anchor="w",pady=2)
+        tk.Checkbutton(opts,text="Auto-scroll",variable=self.autoscroll,bg=BG2,fg=DIM,
+            selectcolor=BG4,activebackground=BG2,font=(F,9)).pack(anchor="w",pady=2)
+        tk.Button(bot,text="Export Transcript",bg=BG4,fg=TEXT,relief="flat",
+            font=(F,9),cursor="hand2",pady=9,activebackground=BG3,
+            command=self._export).pack(fill="x",pady=(0,6))
+        tk.Button(bot,text="Clear",bg=BG2,fg=DIM,relief="flat",
+            font=(F,9),cursor="hand2",pady=9,activebackground=BG3,
+            command=self._clear).pack(fill="x")
 
     def _build_mid(self,mid):
-        # Live bar
-        live=tk.Frame(mid,bg=BG2,pady=14); live.pack(fill="x")
+        # ── Live zone ────────────────────────────────────────────
+        live=tk.Frame(mid,bg=BG3); live.pack(fill="x")
         tk.Frame(mid,bg=BORDER,height=1).pack(fill="x")
-        tr=tk.Frame(live,bg=BG2); tr.pack(fill="x",padx=22)
-        self.live_dot=tk.Label(tr,text="●",bg=BG2,fg=MUT,font=("Helvetica",9)); self.live_dot.pack(side="left")
-        tk.Label(tr,text="  LIVE CAPTION",bg=BG2,fg=MUT,font=("Helvetica",8,"bold")).pack(side="left")
-        self.lat_lbl=tk.Label(tr,text="",bg=BG2,fg=MUT,font=("Helvetica",8)); self.lat_lbl.pack(side="right")
-        self.live_cap=tk.Label(live,text="Waiting for speech...",bg=BG2,fg=DIM,
-            font=("Helvetica",13),anchor="w",wraplength=900,justify="left")
-        self.live_cap.pack(fill="x",padx=22,pady=(8,3))
-        self.live_tr=tk.Label(live,text="",bg=BG2,fg=TEXT,font=("Helvetica",17,"bold"),
-            anchor="w",wraplength=900,justify="left")
-        self.live_tr.pack(fill="x",padx=22,pady=(0,4))
+        # Status row
+        top=tk.Frame(live,bg=BG3); top.pack(fill="x",padx=26,pady=(14,0))
+        self.live_dot=tk.Label(top,text="●",bg=BG3,fg=DIM,font=(F,8)); self.live_dot.pack(side="left")
+        tk.Label(top,text="  LIVE",bg=BG3,fg=DIM,font=(F,8,"bold")).pack(side="left")
+        self.lat_lbl=tk.Label(top,text="",bg=BG3,fg=DIM,font=(FM,8)); self.lat_lbl.pack(side="right")
+        # What Deepgram hears right now (dimmer, smaller)
+        self.live_cap=tk.Label(live,text="Waiting for speech…",bg=BG3,fg=DIM,
+            font=(F,12),anchor="w",wraplength=1100,justify="left")
+        self.live_cap.pack(fill="x",padx=26,pady=(6,2))
+        # Live translation (hero text — big and bold)
+        self.live_tr=tk.Label(live,text="",bg=BG3,fg=TEXT,
+            font=(F,20,"bold"),anchor="w",wraplength=1100,justify="left")
+        self.live_tr.pack(fill="x",padx=26,pady=(2,18))
         tk.Frame(mid,bg=BORDER,height=1).pack(fill="x")
-
-        # Feed
+        # ── Transcript feed ──────────────────────────────────────
         ff=tk.Frame(mid,bg=BG); ff.pack(fill="both",expand=True)
-        sbar=tk.Scrollbar(ff,bg=BG3,troughcolor=BG2,width=5,relief="flat"); sbar.pack(side="right",fill="y")
-        self.feed=tk.Text(ff,bg=BG,fg=TEXT,font=("Helvetica",14),relief="flat",bd=0,
-            padx=24,pady=20,spacing1=2,spacing3=10,wrap="word",yscrollcommand=sbar.set,
-            state="disabled",cursor="arrow")
+        sbar=tk.Scrollbar(ff,bg=BG3,troughcolor=BG2,width=4,relief="flat"); sbar.pack(side="right",fill="y")
+        self.feed=tk.Text(ff,bg=BG,fg=TEXT,font=(F,13),relief="flat",bd=0,
+            padx=30,pady=26,spacing1=3,spacing3=16,wrap="word",
+            yscrollcommand=sbar.set,state="disabled",cursor="arrow")
         self.feed.pack(side="left",fill="both",expand=True); sbar.config(command=self.feed.yview)
-        mono=next((f for f in ["JetBrains Mono","Consolas","Courier New"] if f in tkfont.families()),"Courier")
-        self.feed.tag_config("ts",foreground=MUT,font=(mono,9))
-        self.feed.tag_config("badge_en",foreground=ACCENT,font=(mono,8,"bold"))
-        self.feed.tag_config("badge_es",foreground=YELLOW,font=(mono,8,"bold"))
-        self.feed.tag_config("txt_en",foreground=DIM,font=("Helvetica",12))
-        self.feed.tag_config("txt_es",foreground=DIM,font=("Helvetica",12))
-        self.feed.tag_config("trans",foreground=TEXT,font=("Helvetica",15,"bold"))
-
-        # Confidence strip
+        mono=next((f for f in ["JetBrains Mono","Consolas","Courier New"] if f in tkfont.families()),FM)
+        self.feed.tag_config("ts",   foreground=DIM,       font=(mono,8))
+        self.feed.tag_config("lang", foreground=DIM,       font=(F,8,"bold"))
+        self.feed.tag_config("body", foreground="#b8c4e0", font=(F,13))
+        self.feed.tag_config("tr",   foreground=TEXT,      font=(F,14,"bold"))
+        # ── Footer: confidence ───────────────────────────────────
         tk.Frame(mid,bg=BORDER,height=1).pack(fill="x",side="bottom")
-        cs=tk.Frame(mid,bg=BG2,pady=7); cs.pack(fill="x",side="bottom")
-        tk.Label(cs,text="CONF",bg=BG2,fg=MUT,font=("Helvetica",8)).pack(side="left",padx=(18,8))
-        cbg=tk.Frame(cs,bg=BG4,width=120,height=4); cbg.pack(side="left"); cbg.pack_propagate(False)
-        self.conf_bar=tk.Frame(cbg,bg=ACCENT,height=4); self.conf_bar.place(x=0,y=0,relheight=1,relwidth=0)
-        self.conf_lbl=tk.Label(cs,text="—",bg=BG2,fg=DIM,font=("Helvetica",8)); self.conf_lbl.pack(side="left",padx=6)
+        cs=tk.Frame(mid,bg=BG2,pady=8); cs.pack(fill="x",side="bottom")
+        tk.Label(cs,text="Confidence",bg=BG2,fg=DIM,font=(F,8)).pack(side="left",padx=(22,8))
+        cbg=tk.Frame(cs,bg=BG4,width=100,height=3); cbg.pack(side="left"); cbg.pack_propagate(False)
+        self.conf_bar=tk.Frame(cbg,bg=ACCENT,height=3); self.conf_bar.place(x=0,y=0,relheight=1,relwidth=0)
+        self.conf_lbl=tk.Label(cs,text="—",bg=BG2,fg=DIM,font=(F,8)); self.conf_lbl.pack(side="left",padx=6)
 
     def _build_dbg(self,frm):
         tk.Frame(frm,bg=BORDER,width=1).pack(side="left",fill="y")
         inner=tk.Frame(frm,bg=BG2); inner.pack(side="left",fill="both",expand=True)
-        tk.Label(inner,text="DEBUG LOG",bg=BG2,fg=ACCENT,font=("Helvetica",10,"bold")).pack(anchor="w",padx=14,pady=(14,6))
-
-        # Stats
-        sg=tk.Frame(inner,bg=BG2); sg.pack(fill="x",padx=14,pady=(0,10))
-        self.d_cap=self._dr(sg,"Captured","0 B",0)
-        self.d_sent=self._dr(sg,"Sent to DG","0 B",1)
-        self.d_msgs=self._dr(sg,"DG responses","0",2)
-        self.d_ws=self._dr(sg,"WS","disconnected",3)
-
-        # Waveform
-        self.wave_cv=tk.Canvas(inner,bg=BG,height=60,highlightthickness=1,highlightbackground=BORDER)
-        self.wave_cv.pack(fill="x",padx=14,pady=(0,10))
-
-        # Log
-        lf=tk.Frame(inner,bg=BG); lf.pack(fill="both",expand=True,padx=14,pady=(0,14))
-        ls=tk.Scrollbar(lf,bg=BG3,troughcolor=BG2,width=5); ls.pack(side="right",fill="y")
-        mono=next((f for f in ["Consolas","Courier New"] if f in tkfont.families()),"Courier")
+        tk.Label(inner,text="Debug",bg=BG2,fg=DIM,font=(F,11,"bold")).pack(anchor="w",padx=16,pady=(16,10))
+        sg=tk.Frame(inner,bg=BG2); sg.pack(fill="x",padx=16,pady=(0,10))
+        self.d_cap=self._dr(sg,"Captured","—",0)
+        self.d_sent=self._dr(sg,"Sent","—",1)
+        self.d_msgs=self._dr(sg,"Responses","0",2)
+        self.d_ws=self._dr(sg,"WebSocket","—",3)
+        self.wave_cv=tk.Canvas(inner,bg=BG,height=52,highlightthickness=0)
+        self.wave_cv.pack(fill="x",padx=16,pady=(0,10))
+        lf=tk.Frame(inner,bg=BG); lf.pack(fill="both",expand=True,padx=16,pady=(0,16))
+        ls=tk.Scrollbar(lf,bg=BG3,troughcolor=BG2,width=4); ls.pack(side="right",fill="y")
+        mono=next((f for f in ["Consolas","Courier New"] if f in tkfont.families()),FM)
         self.log_txt=tk.Text(lf,bg=BG,fg=TEXT,font=(mono,8),relief="flat",bd=0,
-            padx=6,pady=4,wrap="word",yscrollcommand=ls.set,state="disabled",height=20)
+            padx=8,pady=4,wrap="word",yscrollcommand=ls.set,state="disabled")
         self.log_txt.pack(side="left",fill="both",expand=True); ls.config(command=self.log_txt.yview)
-        self.log_txt.tag_config("INFO",foreground=TEXT)
+        self.log_txt.tag_config("INFO",foreground="#6b7fa8")
         self.log_txt.tag_config("AUDIO",foreground=ACCENT)
         self.log_txt.tag_config("WS",foreground=PURPLE)
         self.log_txt.tag_config("DG",foreground=GREEN)
@@ -617,20 +611,20 @@ class App:
         self.log_txt.tag_config("WARN",foreground=YELLOW)
 
     def _dr(self,p,label,val,row):
-        tk.Label(p,text=label,bg=BG2,fg=DIM,font=("Helvetica",8)).grid(row=row,column=0,sticky="w",pady=1)
-        lbl=tk.Label(p,text=val,bg=BG2,fg=TEXT,font=("Helvetica",8,"bold"))
-        lbl.grid(row=row,column=1,sticky="e",pady=1); p.columnconfigure(1,weight=1); return lbl
+        tk.Label(p,text=label,bg=BG2,fg=DIM,font=(F,8)).grid(row=row,column=0,sticky="w",pady=2)
+        lbl=tk.Label(p,text=val,bg=BG2,fg=TEXT,font=(F,8,"bold"))
+        lbl.grid(row=row,column=1,sticky="e",pady=2); p.columnconfigure(1,weight=1); return lbl
 
     def _toggle_debug(self):
         if self.show_debug.get(): self.dbg_frame.pack(side="right",fill="y")
         else: self.dbg_frame.pack_forget()
 
-    def _div(self,p): tk.Frame(p,bg=BORDER,height=1).pack(fill="x",pady=10)
-    def _sec(self,p,t): tk.Label(p,text=t,bg=BG2,fg=MUT,font=("Helvetica",8,"bold")).pack(anchor="w",padx=16,pady=(0,4))
+    def _div(self,p): tk.Frame(p,bg=BORDER,height=1).pack(fill="x",padx=18,pady=10)
+    def _sec(self,p,t): tk.Label(p,text=t,bg=BG2,fg=DIM,font=(F,8,"bold")).pack(anchor="w",padx=18,pady=(0,6))
     def _stat(self,p,v,k,r,c):
-        f=tk.Frame(p,bg=BG2); f.grid(row=r,column=c,sticky="w",padx=(0,16),pady=4)
-        lbl=tk.Label(f,text=v,bg=BG2,fg=TEXT,font=("Helvetica",20)); lbl.pack(anchor="w")
-        tk.Label(f,text=k,bg=BG2,fg=DIM,font=("Helvetica",8)).pack(anchor="w"); return lbl
+        f=tk.Frame(p,bg=BG2); f.grid(row=r,column=c,sticky="w",padx=(0,12),pady=4)
+        lbl=tk.Label(f,text=v,bg=BG2,fg=TEXT,font=(F,18,"bold")); lbl.pack(anchor="w")
+        tk.Label(f,text=k,bg=BG2,fg=DIM,font=(F,8)).pack(anchor="w"); return lbl
 
     # ── Devices ─────────────────────────────────────────────────
     def _load_devices(self):
@@ -820,9 +814,9 @@ class App:
 
     def _handle(self,p):
         self.live_cap.config(text=p.text+("  ▋" if p.partial else ""),
-            fg="#475569",font=("Helvetica",12))
+            fg=DIM,font=(F,12))
         self.live_tr.config(text=p.translation if self.show_tr.get() and p.translation else "",
-            fg=TEXT,font=("Helvetica",17,"bold"))
+            fg=TEXT,font=(F,20,"bold"))
         self.conf_bar.place(relwidth=p.conf); self.conf_lbl.config(text=f"{int(p.conf*100)}%")
         self.sv_lang.config(text=p.lang.upper())
         if p.partial:
@@ -929,12 +923,12 @@ class App:
         self.feed.config(state="normal"); self._row(p); self.feed.config(state="disabled")
 
     def _row(self,p):
-        ts=time.strftime("%H:%M:%S",time.localtime(p.ts))
-        self.feed.insert("end",f"{ts}   ","ts")
-        self.feed.insert("end",f"[{p.lang.upper()}]  ",f"badge_{p.lang}")
-        self.feed.insert("end",p.text,f"txt_{p.lang}")
+        ts=time.strftime("%H:%M",time.localtime(p.ts))
+        self.feed.insert("end",f"{ts}  ","ts")
+        self.feed.insert("end",f"{p.lang.upper()}  ","lang")
+        self.feed.insert("end",p.text+"\n","body")
         if self.show_tr.get() and p.translation:
-            self.feed.insert("end","\n    → "+p.translation,"trans")
+            self.feed.insert("end",f"        {p.translation}\n","tr")
         self.feed.insert("end","\n")
 
     def _rebuild(self):
