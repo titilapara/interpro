@@ -8,7 +8,7 @@ python interpro_final.py
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import tkinter.font as tkfont
-import threading, queue, time, json, sys
+import threading, queue, time, json, sys, re
 import numpy as np
 from pathlib import Path
 from typing import Optional
@@ -359,6 +359,11 @@ class AudioCapture:
         if not self._running: return
         if status: self.log.log(f"Stream status: {status}","WARN")
         mono=indata.mean(axis=1) if indata.ndim>1 else indata[:,0]
+        # Pre-emphasis: amplifies high frequencies lost in muffled/distant audio
+        mono=np.append(mono[0:1], mono[1:]-0.97*mono[:-1]).astype(np.float32)
+        # Soft normalise: bring quiet or muffled input up to a consistent level
+        peak=float(np.max(np.abs(mono)))
+        if peak>0.001: mono=(mono/peak)*0.85
         chunk=self._rs.run(mono)
         if len(chunk)<1: return
         rms=float(np.sqrt(np.mean(chunk**2)))
@@ -807,9 +812,10 @@ class App:
         self.log_txt.see("end"); self.log_txt.config(state="disabled")
 
     # ── Feed ─────────────────────────────────────────────────────
-    PARA_MIN_WORDS   = 20   # need at least 20 words before flushing on punctuation
-    PARA_SILENCE_SEC = 3.5  # wait 3.5s of silence before flushing
-    PARA_MAX_WORDS   = 60   # hard cap
+    PARA_MIN_SENTENCES = 2    # flush when ≥2 complete sentences pile up
+    PARA_SILENCE_SEC   = 2.5  # flush after this many seconds of silence
+    PARA_SILENCE_MID   = 1.5  # shorter wait when a sentence is already complete
+    PARA_MAX_WORDS     = 80   # hard word-count cap regardless of sentences
 
     def _handle(self,p):
         self.live_cap.config(text=p.text+("  ▋" if p.partial else ""),
@@ -865,15 +871,35 @@ class App:
         if self._para_timer:
             self._para_timer.cancel(); self._para_timer = None
 
-        words = len(self._para_text.split())
-        ends  = self._para_text.rstrip().endswith((".", "?", "!", "..."))
+        words   = len(self._para_text.split())
+        ends    = bool(re.search(r'[.!?](\s|$)', self._para_text))
+        n_sents = len([s for s in re.split(r'[.!?]+', self._para_text) if s.strip()])
 
-        if (ends and words >= self.PARA_MIN_WORDS) or words >= self.PARA_MAX_WORDS:
+        if ends and n_sents >= self.PARA_MIN_SENTENCES:
+            self._para_flush()
+        elif words >= self.PARA_MAX_WORDS:
             self._para_flush()
         else:
-            self._para_timer = threading.Timer(self.PARA_SILENCE_SEC, self._sched_flush)
+            # If a sentence is already complete, wait less before flushing
+            wait = self.PARA_SILENCE_MID if ends else self.PARA_SILENCE_SEC
+            self._para_timer = threading.Timer(wait, self._sched_flush)
             self._para_timer.daemon = True
             self._para_timer.start()
+
+    @staticmethod
+    def _clean_text(text):
+        """Remove stutters, normalise spacing, capitalise, ensure closing punctuation."""
+        # Collapse word-level stutters: "I I want" → "I want"
+        text = re.sub(r'\b(\w+)(\s+\1)+\b', r'\1', text, flags=re.IGNORECASE)
+        # Collapse filler phrases Deepgram occasionally duplicates
+        text = re.sub(r'(\b\w[\w\s]{0,20}?)\s+\1', r'\1', text)
+        text = ' '.join(text.split())
+        if not text: return text
+        # Capitalise first letter
+        text = text[0].upper() + text[1:]
+        # Ensure paragraph ends with punctuation
+        if text[-1] not in '.!?…': text += '.'
+        return text
 
     def _sched_flush(self):
         try: self.ui_q.put_nowait(("flush_para", None))
@@ -888,6 +914,8 @@ class App:
             lang=self._para_lang; conf=self._para_conf; ts=self._para_ts or time.time()
             self._para_text=""; self._para_trans=""
             self._para_conf=0.0; self._para_ts=None
+        text  = App._clean_text(text)
+        if trans and trans[-1] not in '.!?…': trans += '.'
         p = Phrase(id=f"para_{self.seg_count:04d}",
                    text=text, translation=trans,
                    lang=lang, conf=conf, ts=ts, partial=False)
