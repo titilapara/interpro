@@ -154,74 +154,66 @@ class Resampler:
         return np.interp(np.linspace(0,len(audio)-1,n),np.arange(len(audio)),audio).astype(np.float32)
 
 # ── Translator ───────────────────────────────────────────────────
-# Languages DeepL free supports (others fall back to Google)
-_DEEPL_LANGS = {
-    "en","es","fr","de","it","pt","nl","ru","pl","ja","ko","zh",
-    "sv","tr","uk","bg","cs","da","el","et","fi","hu","id","lt",
-    "lv","ro","sk","sl",
-}
-# System prompt for Claude — cached on Anthropic's servers, costs ~nothing to reuse
-_CLAUDE_SYS = (
-    "You are an expert bilingual translator for live spoken audio.\n"
-    "Rules:\n"
-    "1. Output ONLY the translation — no notes, no explanations.\n"
-    "2. The input comes from speech-to-text and may contain stutters, "
-    "filler words (um, uh, este, o sea) or repeated phrases. Clean them up.\n"
-    "3. Never translate idioms word-for-word — use the natural equivalent.\n"
-    "4. Translate English→Spanish or Spanish→English based on the source language provided."
-)
+_CLAUDE_SYS = """\
+You are an expert translator for live spoken audio captured by a speech-to-text API.
+
+Rules:
+1. Output ONLY the translated text — no explanations, labels, or commentary.
+2. The input may contain speech artifacts (stutters, filler words like "um", "uh", \
+"este", "o sea", repeated phrases). Clean them up naturally.
+3. Translate idioms to their natural equivalent — never word-for-word.
+4. Watch for false cognates (e.g. "actual" in Spanish = "current", not "actual").
+5. If a [LOW CONFIDENCE] tag is present, the audio was muffled — infer meaning \
+from context and clean up aggressively."""
 
 class Translator:
     """
-    3-tier translation engine:
-      1. DeepL  (free tier, best quality) — when confidence ≥ threshold
-      2. Claude (Anthropic API)           — when confidence < threshold (bad/muffled audio)
-      3. Google Translate                 — always-free fallback if keys not set
-    """
-    CONF_THRESHOLD = 0.78   # below this, audio was rough → send to Claude
+    2-tier engine:
+      1. Claude API  — primary (best quality, handles muffled audio intelligently)
+      2. Google      — free fallback (no key needed, always works)
 
+    Confidence score is passed to Claude as a context hint so it knows
+    when to be more aggressive about cleaning up garbled transcripts.
+    """
     def __init__(self):
         self._google_cache = {}
-        self._deepl_key    = ""
-        self._claude       = None          # Anthropic client, set via set_anthropic_key()
-        self._claude_sys   = _CLAUDE_SYS
+        self._claude       = None
         try: from deep_translator import GoogleTranslator; self._google_ok=True
         except: self._google_ok=False
 
-    # ── Key setters (called from UI) ────────────────────────────
-    def set_deepl_key(self, key):
-        self._deepl_key = key.strip()
-
     def set_anthropic_key(self, key):
-        key = key.strip()
         self._claude = None
+        key = key.strip()
         if key:
             try:
                 from anthropic import Anthropic
                 self._claude = Anthropic(api_key=key)
             except ImportError:
-                pass   # anthropic package not installed — silent skip
+                pass  # package not installed — falls back to Google silently
 
-    # ── Main entry point ─────────────────────────────────────────
     def translate(self, text, src, tgt, conf=1.0):
         if not text.strip() or src == tgt: return ""
-
-        # Low-confidence audio (muffled / noisy) → Claude cleans + translates
-        if conf < self.CONF_THRESHOLD and self._claude:
-            result = self._claude_translate(text, src, tgt)
+        if self._claude:
+            result = self._claude_translate(text, src, tgt, conf)
             if result: return result
-
-        # Good audio → DeepL if key set and language pair supported
-        if self._deepl_key:
-            s = src.split("-")[0].lower(); t = tgt.split("-")[0].lower()
-            if s in _DEEPL_LANGS and t in _DEEPL_LANGS:
-                result = self._deepl_translate(text, src, tgt)
-                if result: return result
-
-        # Always-free fallback
         return self._google_translate(text, src, tgt)
 
-    # ── Backends ─────────────────────────────────────────────────
+    def _claude_translate(self, text, src, tgt, conf):
+        try:
+            # Tell Claude when audio was rough so it cleans up more aggressively
+            quality = "" if conf >= 0.78 else "[LOW CONFIDENCE] "
+            resp = self._claude.messages.create(
+                model="claude-3-5-haiku-20241022",
+                max_tokens=500,
+                temperature=0.1,
+                system=[{"type":"text","text":_CLAUDE_SYS,
+                         "cache_control":{"type":"ephemeral"}}],
+                messages=[{"role":"user","content":
+                    f"Translate from {src} to {tgt}:\n\n{quality}{text}"}]
+            )
+            return resp.content[0].text.strip()
+        except: return ""
+
     def _google_translate(self, text, src, tgt):
         if not self._google_ok: return ""
         k = f"{src}>{tgt}"
@@ -230,30 +222,6 @@ class Translator:
             self._google_cache[k] = GoogleTranslator(source=src, target=tgt)
         try: return self._google_cache[k].translate(text) or ""
         except: self._google_cache.pop(k, None); return ""
-
-    def _deepl_translate(self, text, src, tgt):
-        try:
-            from deep_translator import DeepLTranslator
-            s = src.split("-")[0].upper(); t = tgt.split("-")[0].upper()
-            return DeepLTranslator(
-                source=s, target=t,
-                api_key=self._deepl_key, use_free_api=True
-            ).translate(text) or ""
-        except: return ""
-
-    def _claude_translate(self, text, src, tgt):
-        try:
-            resp = self._claude.messages.create(
-                model="claude-3-5-haiku-20241022",
-                max_tokens=500,
-                temperature=0.1,
-                system=[{"type":"text","text":self._claude_sys,
-                          "cache_control":{"type":"ephemeral"}}],
-                messages=[{"role":"user",
-                           "content":f"Source language: {src}\nTarget language: {tgt}\n\n{text}"}]
-            )
-            return resp.content[0].text.strip()
-        except: return ""
 
 # ── Deepgram Stream ──────────────────────────────────────────────
 class DeepgramStream:
@@ -528,11 +496,7 @@ class App:
 
         # Tk vars
         self.api_key_var=tk.StringVar(value=self._load_key())
-        self.deepl_key_var=tk.StringVar(value=self._load_key("deepl.key"))
         self.anthropic_key_var=tk.StringVar(value=self._load_key("anthropic.key"))
-        # Wire saved keys into the translator
-        if self.deepl_key_var.get():
-            self.translator.set_deepl_key(self.deepl_key_var.get())
         if self.anthropic_key_var.get():
             self.translator.set_anthropic_key(self.anthropic_key_var.get())
         self.src_lang_var=tk.StringVar(value="Auto Detect")
@@ -605,20 +569,8 @@ class App:
             cursor="hand2",padx=10,pady=7,activebackground=BG4,
             bd=0,command=self._save_key).pack(side="left")
         tk.Label(aw,text="console.deepgram.com",bg=BG2,fg=DIM,font=(F,8)).pack(anchor="w",pady=(5,0))
-        # ── DeepL key (optional) ─────────────────────────────────
-        self._sec(sb,"DEEPL KEY  (optional — free tier)")
-        dw2=tk.Frame(sb,bg=BG2); dw2.pack(fill="x",**px)
-        dk=tk.Frame(dw2,bg=BG3); dk.pack(fill="x")
-        self.deepl_entry=tk.Entry(dk,textvariable=self.deepl_key_var,bg=BG3,fg=TEXT,
-            insertbackground=GREEN,relief="flat",font=(F,9),show="●",bd=0)
-        self.deepl_entry.pack(side="left",fill="x",expand=True,ipady=7,padx=(10,0))
-        tk.Button(dk,text="Save",bg=BG3,fg=GREEN,relief="flat",font=(F,8,"bold"),
-            cursor="hand2",padx=10,pady=7,activebackground=BG4,bd=0,
-            command=self._save_deepl_key).pack(side="left")
-        tk.Label(dw2,text="deepl.com/pro-api  ·  free · better quality",
-            bg=BG2,fg=DIM,font=(F,8)).pack(anchor="w",pady=(5,0))
-        # ── Anthropic key (optional) ─────────────────────────────
-        self._sec(sb,"ANTHROPIC KEY  (optional — bad audio only)")
+        # ── Anthropic key ─────────────────────────────────────────
+        self._sec(sb,"CLAUDE API KEY")
         aw2=tk.Frame(sb,bg=BG2); aw2.pack(fill="x",**px)
         ak=tk.Frame(aw2,bg=BG3); ak.pack(fill="x")
         self.anthropic_entry=tk.Entry(ak,textvariable=self.anthropic_key_var,bg=BG3,fg=TEXT,
@@ -627,7 +579,7 @@ class App:
         tk.Button(ak,text="Save",bg=BG3,fg=PURPLE,relief="flat",font=(F,8,"bold"),
             cursor="hand2",padx=10,pady=7,activebackground=BG4,bd=0,
             command=self._save_anthropic_key).pack(side="left")
-        tk.Label(aw2,text="console.anthropic.com  ·  used when conf < 78%",
+        tk.Label(aw2,text="console.anthropic.com  ·  best quality + muffled audio",
             bg=BG2,fg=DIM,font=(F,8)).pack(anchor="w",pady=(5,0))
         self._div(sb)
         # ── Device ───────────────────────────────────────────────
@@ -796,14 +748,6 @@ class App:
         k=self.api_key_var.get().strip()
         if k: self._save_key_file(k); self.hdr_status.config(text="Key saved",fg=GREEN)
         else: self.hdr_status.config(text="Enter key first",fg=YELLOW)
-
-    def _save_deepl_key(self):
-        k=self.deepl_key_var.get().strip()
-        if k:
-            self._save_key_file(k,"deepl.key")
-            self.translator.set_deepl_key(k)
-            self.hdr_status.config(text="DeepL key saved",fg=GREEN)
-        else: self.hdr_status.config(text="Enter DeepL key first",fg=YELLOW)
 
     def _save_anthropic_key(self):
         k=self.anthropic_key_var.get().strip()
