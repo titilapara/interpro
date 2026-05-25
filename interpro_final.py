@@ -20,7 +20,36 @@ import websocket  # websocket-client
 TARGET_SR    = 16000
 CAPTURE_MS   = 50
 SUPPORTED_SR = [16000, 44100, 48000, 32000]
-ALLOWED_LANGS = {"en", "es"}
+# Languages: display name → (Deepgram code, Google Translate code)
+LANGUAGES = {
+    "Auto Detect": ("multi", "auto"),
+    "English":     ("en-US", "en"),
+    "Spanish":     ("es",    "es"),
+    "French":      ("fr",    "fr"),
+    "German":      ("de",    "de"),
+    "Italian":     ("it",    "it"),
+    "Portuguese":  ("pt",    "pt"),
+    "Dutch":       ("nl",    "nl"),
+    "Russian":     ("ru",    "ru"),
+    "Ukrainian":   ("uk",    "uk"),
+    "Polish":      ("pl",    "pl"),
+    "Swedish":     ("sv",    "sv"),
+    "Turkish":     ("tr",    "tr"),
+    "Arabic":      ("ar",    "ar"),
+    "Hindi":       ("hi",    "hi"),
+    "Japanese":    ("ja",    "ja"),
+    "Korean":      ("ko",    "ko"),
+    "Chinese":     ("zh",    "zh-CN"),
+}
+# Map Deepgram short codes → Google Translate codes for auto-detected langs
+DG_TO_TRANS = {
+    "en":"en","es":"es","fr":"fr","de":"de","it":"it","pt":"pt",
+    "nl":"nl","ru":"ru","uk":"uk","pl":"pl","sv":"sv","tr":"tr",
+    "ar":"ar","hi":"hi","ja":"ja","ko":"ko","zh":"zh-CN",
+}
+LANG_NAMES   = list(LANGUAGES.keys())
+LANG_NAMES_T = [n for n in LANG_NAMES if n != "Auto Detect"]  # target can't be "Auto"
+
 VBCABLE_KW  = ["cable output","cable-b","cable-c","cable-d","vb-audio",
                "voicemeeter output","voicemeeter aux","voicemeeter vaio"]
 LOOPBACK_KW = ["stereo mix","loopback","what u hear","wave out","mixage","mezcla","monitor of"]
@@ -41,19 +70,9 @@ class Phrase:
     conf:float; ts:float; partial:bool; refined:bool=False
 
 # ── URL builder ──────────────────────────────────────────────────
-def build_dg_url(lang_hint: Optional[str]) -> str:
-    """
-    Build Deepgram WebSocket URL.
-    Uses ONLY parameters verified to work in audio_pipeline_test.py.
-    NO detect_language (conflicts with language=multi).
-    NO vad_events, no_delay, or other unverified params.
-    """
-    if lang_hint == "en":
-        lang = "en-US"
-    elif lang_hint == "es":
-        lang = "es"
-    else:
-        lang = "multi"      # Deepgram auto-detects EN/ES with language=multi
+def build_dg_url(src_lang_name: str) -> str:
+    """Build Deepgram WebSocket URL from a LANGUAGES display name."""
+    lang = LANGUAGES.get(src_lang_name, ("multi","auto"))[0]
 
     url = (
         "wss://api.deepgram.com/v1/listen"
@@ -160,16 +179,19 @@ class DeepgramStream:
         self.translator=translator; self.log=log
         self._ws=None; self._connected=False; self._running=False
         self._audio_q=queue.Queue(maxsize=500)
-        self._lang_hint=None; self._phrase_n=0; self._cur_id=None
+        self._src_name="Auto Detect"; self._tgt_code="es"
+        self._phrase_n=0; self._cur_id=None
         self._bytes_sent=0; self._msgs_recv=0
         self._first_audio_t=None; self._first_resp_t=None
         self._open_evt=threading.Event()
 
-    def connect(self, lang_hint=None):
-        self._lang_hint=lang_hint; self._running=True
+    def connect(self, src_lang_name="Auto Detect", tgt_lang_name="Spanish"):
+        self._src_name=src_lang_name
+        self._tgt_code=LANGUAGES.get(tgt_lang_name,("es","es"))[1]
+        self._running=True
         self._open_evt.clear(); self._connected=False
 
-        url = build_dg_url(lang_hint)
+        url = build_dg_url(src_lang_name)
         self.log.log(f"URL: {url}","WS")      # Log FULL URL so we can verify
 
         self._ws = websocket.WebSocketApp(
@@ -235,8 +257,8 @@ class DeepgramStream:
                 if self._cur_id is None: self._phrase_n+=1
                 self._cur_id=None
 
-            tgt="es" if lang=="en" else "en"
-            tr=self.translator.translate(text,lang,tgt)
+            src_code=DG_TO_TRANS.get(lang, lang)
+            tr=self.translator.translate(text, src_code, self._tgt_code)
             p=Phrase(id=pid,text=text,translation=tr,lang=lang,
                      conf=conf,ts=time.time(),partial=not is_final)
             self.log.log(f"{'FINAL' if is_final else 'part'} [{lang}] {text[:50]}","DG")
@@ -292,14 +314,16 @@ class DeepgramStream:
             time.sleep(0.01)
 
     def _lang(self, alt, data):
+        # If user chose a specific source language, trust it
+        if self._src_name != "Auto Detect":
+            return LANGUAGES[self._src_name][1]   # e.g. "en", "fr", "ja"
+        # Otherwise use Deepgram's detected language
         d=(data.get("channel",{}).get("detected_language","") or
            data.get("metadata",{}).get("detected_language",""))
         if not d:
             words=alt.get("words",[])
             d=words[0].get("language","") if words else ""
-        if not d: d=self._lang_hint or "en"
-        d=d.lower().split("-")[0]
-        return d if d in ALLOWED_LANGS else (self._lang_hint if self._lang_hint in ALLOWED_LANGS else "en")
+        return DG_TO_TRANS.get(d.lower().split("-")[0], "en")
 
     def send_pcm(self, pcm):
         try: self._audio_q.put_nowait(pcm)
@@ -413,11 +437,12 @@ class App:
         self.devices=[]; self._dg=None; self._cap=None
 
         self.log.log("InterPro starting","INFO")
-        self.log.log(f"Build URL test: {build_dg_url(None)[:80]}","INFO")
+        self.log.log(f"Build URL test: {build_dg_url('Auto Detect')[:80]}","INFO")
 
         # Tk vars
         self.api_key_var=tk.StringVar(value=self._load_key())
-        self.lang_var=tk.StringVar(value="auto")
+        self.src_lang_var=tk.StringVar(value="Auto Detect")
+        self.tgt_lang_var=tk.StringVar(value="Spanish")
         self.dev_var=tk.StringVar()
         self.show_tr=tk.BooleanVar(value=True)
         self.autoscroll=tk.BooleanVar(value=True)
@@ -502,13 +527,15 @@ class App:
             font=(F,8),wraplength=228,justify="left")
         self.dev_lbl.pack(anchor="w",pady=(5,0))
         self._div(sb)
-        # ── Direction ────────────────────────────────────────────
-        self._sec(sb,"DIRECTION")
+        # ── Languages ─────────────────────────────────────────────
+        self._sec(sb,"LISTEN IN")
         lw=tk.Frame(sb,bg=BG2); lw.pack(fill="x",**px)
-        for v,l in [("auto","Auto  EN ↔ ES"),("en","English → Spanish"),("es","Spanish → English")]:
-            tk.Radiobutton(lw,text=l,variable=self.lang_var,value=v,bg=BG2,fg=DIM,
-                selectcolor=BG4,activebackground=BG2,activeforeground=TEXT,
-                font=(F,9)).pack(anchor="w",pady=3)
+        ttk.Combobox(lw,textvariable=self.src_lang_var,values=LANG_NAMES,
+            state="readonly",style="IP.TCombobox",font=(F,9)).pack(fill="x")
+        self._sec(sb,"TRANSLATE TO")
+        tw=tk.Frame(sb,bg=BG2); tw.pack(fill="x",**px)
+        ttk.Combobox(tw,textvariable=self.tgt_lang_var,values=LANG_NAMES_T,
+            state="readonly",style="IP.TCombobox",font=(F,9)).pack(fill="x")
         self._div(sb)
         # ── Audio meter ──────────────────────────────────────────
         self._sec(sb,"INPUT LEVEL")
@@ -665,7 +692,7 @@ class App:
         if idx<0 or idx>=len(self.devices):
             messagebox.showerror("No Device","Select an audio input device."); return
         dev=self.devices[idx]
-        lang=self.lang_var.get(); hint=None if lang=="auto" else lang
+        src=self.src_lang_var.get(); tgt=self.tgt_lang_var.get()
 
         self.rec_btn.config(state="disabled",text="Connecting...")
         self.pipe_lbl.config(text="Connecting to Deepgram...",fg=YELLOW)
@@ -674,10 +701,10 @@ class App:
         # Connect in background — _poll handles connect_result so the UI stays live
         self._dg=DeepgramStream(api_key,self.ui_q,self.translator,self.log)
         self._pending_dev=dev
-        threading.Thread(target=self._do_connect,args=(self._dg,hint),daemon=True).start()
+        threading.Thread(target=self._do_connect,args=(self._dg,src,tgt),daemon=True).start()
 
-    def _do_connect(self,dg,hint):
-        ok=dg.connect(lang_hint=hint)
+    def _do_connect(self,dg,src,tgt):
+        ok=dg.connect(src_lang_name=src,tgt_lang_name=tgt)
         try: self.ui_q.put_nowait(("connect_result",ok))
         except: pass
 
