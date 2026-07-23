@@ -9,7 +9,7 @@
 
 #define AppName    "Sayvo"
 #define AppVersion "1.0"
-#define SourceExe  "dist\Sayvo_v31.exe"
+#define SourceExe  "dist\Sayvo_v38.exe"
 
 [Setup]
 AppName={#AppName}

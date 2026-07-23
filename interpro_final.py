@@ -4,8 +4,9 @@ Sayvo — Professional Real-Time Interpreter Tool
 ===================================================
 Dual-track architecture:
   LIVE zone  — raw text + instant Google translation overlay
-  Bubble zone — full paragraph + Claude 3.5 Haiku quality translation
+  Bubble zone — full paragraph + Claude (claude-haiku-4-5) quality translation
 """
+__version__ = "38"
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import tkinter.font as tkfont
@@ -60,7 +61,7 @@ VBCABLE_KW  = ["cable output","cable-b","cable-c","cable-d","vb-audio",
 LOOPBACK_KW = ["stereo mix","loopback","what u hear","wave out","mixage","mezcla","monitor of"]
 
 # ── Palette ──────────────────────────────────────────────────────
-BG="#0a0c13"; BG2="#0f121c"; BG3="#151927"; BG4="#1d2333"; BORDER="#242c44"
+BG="#0a0c13"; BG2="#0f121c"; BG3="#161b2c"; BG4="#1e2540"; BORDER="#28304d"
 ACCENT="#6c7ffb"; GREEN="#2dd4a7"; YELLOW="#f5c542"; RED="#e5484d"
 TEXT="#eef1ff"; DIM="#5b6b8f"; MUT="#182136"; PURPLE="#a78bfa"
 ACCENT_HOV="#5468ea"; RED_HOV="#c93d42"
@@ -131,6 +132,132 @@ def _words_to_digits(text: str) -> str:
         return ' '.join(_DIGIT_WORDS.get(w.lower(), w) for w in words if w)
     return _DIGIT_RUN.sub(conv, text)
 
+# ── Compound spoken numbers (ES + EN grammar parser) ─────────────
+# "doscientos cincuenta y tres" → 253, "dos mil veinticuatro" → 2024,
+# "two hundred fifty three" → 253, "eighteen hundred" → 1800.
+# Deterministic with guardrails: lone units/articles ("una vez"),
+# lone "mil"/"cien"/"hundred" ("mil gracias") are never touched.
+_NW_UNIT = {  # value, category 'u'
+    "un":1,"uno":1,"una":1,"dos":2,"tres":3,"cuatro":4,"cinco":5,
+    "seis":6,"siete":7,"ocho":8,"nueve":9,
+    "one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7,
+    "eight":8,"nine":9,
+}
+_NW_TEEN = {  # 10-29 single words — safe as lone words
+    "diez":10,"once":11,"doce":12,"trece":13,"catorce":14,"quince":15,
+    "dieciseis":16,"diecisiete":17,"dieciocho":18,"diecinueve":19,
+    "veinte":20,"veintiun":21,"veintiuno":21,"veintiuna":21,"veintidos":22,
+    "veintitres":23,"veinticuatro":24,"veinticinco":25,"veintiseis":26,
+    "veintisiete":27,"veintiocho":28,"veintinueve":29,
+    "ten":10,"eleven":11,"twelve":12,"thirteen":13,"fourteen":14,
+    "fifteen":15,"sixteen":16,"seventeen":17,"eighteen":18,"nineteen":19,
+}
+_NW_TENS = {
+    "treinta":30,"cuarenta":40,"cincuenta":50,"sesenta":60,"setenta":70,
+    "ochenta":80,"noventa":90,
+    "twenty":20,"thirty":30,"forty":40,"fifty":50,"sixty":60,
+    "seventy":70,"eighty":80,"ninety":90,
+}
+_NW_HUND_ES = {  # absolute values
+    "ciento":100,"doscientos":200,"doscientas":200,"trescientos":300,
+    "trescientas":300,"cuatrocientos":400,"cuatrocientas":400,
+    "quinientos":500,"quinientas":500,"seiscientos":600,"seiscientas":600,
+    "setecientos":700,"setecientas":700,"ochocientos":800,"ochocientas":800,
+    "novecientos":900,"novecientas":900,"cien":100,
+}
+_NW_MULT = {"mil":1000,"thousand":1000,"hundred":100,
+            "millon":1000000,"millones":1000000,"million":1000000}
+_NW_RISKY_ALONE = set(_NW_UNIT) | {"cien","ciento","mil"} | set(_NW_MULT)
+
+def _deaccent(w: str) -> str:
+    import unicodedata
+    return ''.join(c for c in unicodedata.normalize("NFD", w)
+                   if unicodedata.category(c) != "Mn")
+
+def _compound_numbers_to_digits(text: str) -> str:
+    # Toll-free prefix first — "one eight hundred" is 1-800, not 801/900
+    text = re.sub(r'(?i)\b(?:one|uno|un)[,\s\-]+(?:eight\s+hundred|ochocientos)\b',
+                  "1-800", text)
+    # EN hyphenated compounds: "fifty-three" → "fifty three"
+    text = re.sub(r'(?i)\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)-'
+                  r'(one|two|three|four|five|six|seven|eight|nine)\b',
+                  r'\1 \2', text)
+
+    tokens = text.split(' ')
+    out, i = [], 0
+    def classify(tok):
+        core = _deaccent(tok.strip('.,;:!?¿¡()"…').lower())
+        for table, kind in ((_NW_UNIT,'u'), (_NW_TEEN,'t'), (_NW_TENS,'d'),
+                            (_NW_HUND_ES,'h'), (_NW_MULT,'m')):
+            if core in table:
+                return table[core], kind, core
+        return None, None, core
+
+    def _ok_next(prev, cur):
+        """Number-grammar transitions. Bare unit chains ('nine five four')
+        are dictation, not compounds — reject so the digit-run pass gets them."""
+        if prev is None: return True
+        pv, pk = prev; cv, ck = cur
+        if pk in ('u', 't'): return ck == 'm'
+        if pk == 'd':        return ck in ('u', 'm')
+        if pk == 'h':        return ck in ('u', 't', 'd', 'm')
+        if pk == 'm':
+            if pv == 100:    return ck in ('u', 't', 'd') or (ck == 'm' and cv >= 1000)
+            return ck in ('u', 't', 'd', 'h')
+        return True
+
+    while i < len(tokens):
+        v, kind, core = classify(tokens[i])
+        if v is None:
+            out.append(tokens[i]); i += 1; continue
+        # collect the full number-word sequence
+        seq = []          # (value, kind, core)
+        raw_end = i
+        j = i
+        while j < len(tokens):
+            v2, k2, c2 = classify(tokens[j])
+            if v2 is not None:
+                prev = (seq[-1][0], seq[-1][1]) if seq else None
+                if not _ok_next(prev, (v2, k2)):
+                    break                     # dictation / new number starts
+                seq.append((v2, k2, c2)); raw_end = j
+                # sequence stops after a token carrying trailing punctuation
+                if tokens[j].rstrip() != tokens[j].rstrip('.,;:!?…'):
+                    j += 1; break
+                j += 1; continue
+            # connectors: ES "y" between tens+unit, EN "and" after >=100
+            if c2 in ("y", "and") and seq and j + 1 < len(tokens):
+                v3, k3, _ = classify(tokens[j+1])
+                prev_k = seq[-1][1]
+                if v3 is not None and (
+                        (c2 == "y" and prev_k == 'd' and k3 == 'u') or
+                        (c2 == "and" and k3 in ('u','t','d'))):
+                    j += 1; continue
+            break
+        # guardrails: lone risky words stay words ("una vez", "mil gracias")
+        if len(seq) == 1 and seq[0][2] in _NW_RISKY_ALONE:
+            out.append(tokens[i]); i += 1; continue
+        # compute value
+        total = current = 0
+        valid = True
+        for v2, k2, _ in seq:
+            if k2 in ('u','t','d','h'):
+                current += v2
+            elif k2 == 'm':
+                if v2 == 100:
+                    current = (current if current else 1) * 100
+                else:
+                    total += (current if current else 1) * v2
+                    current = 0
+        value = total + current
+        if not valid or value <= 0:
+            out.append(tokens[i]); i += 1; continue
+        # preserve trailing punctuation of the last consumed token
+        tail = tokens[raw_end][len(tokens[raw_end].rstrip('.,;:!?…')):]
+        out.append(str(value) + tail)
+        i = raw_end + 1
+    return ' '.join(out)
+
 def _split_sentences(text: str) -> list:
     """Split a Deepgram final into individual sentences so each can be
     flushed separately.  Splits at .!?… followed by a space+uppercase letter
@@ -179,16 +306,30 @@ def _format_phone(text: str) -> str:
         if n == 7:
             return f"{digits[:3]}-{digits[3:]}"
         return m.group(0)
+    # Toll-free: 1-8xx followed by 7 digits in any spacing/grouping
+    def _tollfree(m):
+        digits = re.sub(r'\D', '', m.group(2))
+        return f"1-{m.group(1)}-{digits[:3]}-{digits[3:]}"
+    text = re.sub(
+        r'(?<!\d)1[\s\-]?(8(?:00|88|77|66|55|44|33))[\s\-]?'
+        r'((?:\d[\s\-]?){6}\d)(?!\d)',
+        _tollfree, text)
     # Match: one digit followed by 6–10 more (space + digit) pairs — total 7–11 digits
     return re.sub(r'(?<!\d)\d(?: \d){6,10}(?!\d)', _reformat, text)
 
 # ── Key-fact extraction ──────────────────────────────────────────
 _FACT_PATTERNS = [
-    ("📞", re.compile(r'(?:\+1 )?\(\d{3}\) \d{3}-\d{4}|\d{3}-\d{4}')),
+    # phones: (954) 806-6120 / 1-800-555-1234 / 555-123-4567 / 806-6120
+    ("📞", re.compile(r'(?:\+1 )?\(\d{3}\) \d{3}-\d{4}'
+                      r'|\b1-8\d{2}-\d{3}-\d{4}\b'
+                      r'|\b\d{3}-\d{3}-\d{4}\b'
+                      r'|\b\d{3}-\d{4}\b')),
     ("$",  re.compile(r'\$\d[\d,]*(?:\.\d{1,2})?')),
-    ("✉",  re.compile(r'[\w.+-]+@[\w-]+\.\w+')),
-    ("📅", re.compile(r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}(?:st|nd|rd|th)?|\d{1,2}/\d{1,2}(?:/\d{2,4})?', re.IGNORECASE)),
-    ("#",  re.compile(r'\d{5,}')),
+    ("✉",  re.compile(r'\b[\w.+-]+@[\w-]+\.\w+\b')),
+    # word-boundary guards: without them 'Decide 5' matched as a date
+    ("📅", re.compile(r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)\b\.? \d{1,2}(?:st|nd|rd|th)?\b'
+                      r'|\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b', re.IGNORECASE)),
+    ("#",  re.compile(r'\b\d{5,}\b')),
 ]
 
 def _extract_facts(text: str):
@@ -427,13 +568,20 @@ under oath = bajo juramento; case number = número de caso
    - Digits stay digits, exactly as written: "(954) 806-6120", "$1,250.75", \
 "2004" — copy them character for character. Never expand digits to words.
    - Spoken compound numbers become digits naturally: "dos mil cuatro" → \
-"2004"; "nineteen ninety" → "1990"; "cuatrocientos ochenta" → "480".
+"2004"; "nineteen ninety" → "1990"; "cuatrocientos ochenta" → "480"; \
+"doscientos cincuenta y tres" → "253"; "one eight hundred" → "1-800".
    - Dates: render clearly for the target audience — "February 19th, 2004" → \
 "19 de febrero de 2004"; "el 3 de marzo" → "March 3rd".
    - Letter spell-outs must survive exactly: "B as in boy, A as in apple" → \
 "B de boy, A de apple" (keep the LETTERS; the mnemonic words may adapt).
    - Alphanumeric codes ("claim number A as in apple 4 7 9") — keep every \
 letter and digit in order; never merge or reorder them.
+   - NEVER invent, complete, or merge digits. Translate EXACTLY the digits \
+present in the input — no more, no fewer. If the caller gives a partial \
+number ("468 38 95"), output that partial number verbatim. Do NOT combine \
+it with phone numbers or digits from earlier context, and do NOT reformat \
+partial digits into a full phone number. A wrong-but-plausible number is \
+far worse than a visibly partial one.
 
 14. WHAT NEVER GETS TRANSLATED.
    - Person names, company names, street names, product names, email \
@@ -819,7 +967,8 @@ class DeepgramStream:
             if not alts: return
             alt = alts[0]; text = alt.get("transcript","").strip()
             is_final = data.get("is_final", False)
-            conf = float(alt.get("confidence", 0.0))
+            try:    conf = float(alt.get("confidence", 0.0))
+            except (TypeError, ValueError): conf = 0.0
             if not text: return
 
             lang = self._lang(alt, data)
@@ -838,6 +987,7 @@ class DeepgramStream:
             # smart_format/punctuation and is the safe default.
             # Format BEFORE building runs — the runs tuple captures this
             # string, so formatting after would be silently discarded.
+            text = _compound_numbers_to_digits(text)
             text = _words_to_digits(text)
             text = _format_currency(text)
             text = _format_phone(text)
@@ -872,7 +1022,8 @@ class DeepgramStream:
                     run_text = " ".join(
                         w.get("punctuated_word") or w.get("word","") for w in run_words
                     ).strip()
-                    run_text = _format_phone(_format_currency(_words_to_digits(run_text)))
+                    run_text = _format_phone(_format_currency(
+                        _words_to_digits(_compound_numbers_to_digits(run_text))))
                 if not run_text:
                     continue
 
@@ -1246,7 +1397,7 @@ class App:
         self.tm         = TranslationMemory(self.log)
         self.devices    = []; self._dg = None; self._cap = None
 
-        self.log.log("Sayvo starting","INFO")
+        self.log.log(f"Sayvo v{__version__} starting","INFO")
         self.log.log(f"URL preview: {build_dg_url('Auto Detect')[:100]}","INFO")
 
         # ── Tk variables (restored from saved settings) ──────────
@@ -1266,6 +1417,12 @@ class App:
         self.show_debug   = tk.BooleanVar(value=False)
         self.textsize_var = tk.StringVar(value=self._settings.get("textsize", "Normal"))
         self._fs = {"Normal": 0, "Large": 2, "Extra Large": 5}.get(self.textsize_var.get(), 0)
+        # Split view (two columns) is a USER toggle, not auto-from-width —
+        # auto-flipping on resize caused a resize->rebuild->resize freeze.
+        self._twocol     = bool(self._settings.get("twocol", True))
+        self.twocol_var  = tk.BooleanVar(value=self._twocol)
+        self._narrow     = False   # render stacked when genuinely too narrow
+        self._rebuilding = False   # hard reentrancy guard against rebuild loops
 
         self._build()
         self._load_devices()
@@ -1286,6 +1443,10 @@ class App:
             self.log.log("Global hotkey Ctrl+Shift+F active","INFO")
         except Exception as e:
             self.log.log(f"Global hotkey unavailable: {e}","WARN")
+
+        # Restore collapsed sidebar from last session
+        if self._settings.get("sidebar_hidden"):
+            self._toggle_sidebar()
 
         # First-run setup wizard (reappears until completed or skipped forever)
         if not self._settings.get("wizard_done"):
@@ -1401,50 +1562,72 @@ class App:
         hdr.pack(fill="x"); hdr.pack_propagate(False)
         tk.Frame(self.root, bg=BORDER, height=1).pack(fill="x")
 
+        ctk.CTkButton(hdr, text="☰", width=34, height=28,
+            fg_color="transparent", hover_color=BG3, text_color=DIM,
+            font=(F,13), corner_radius=8, command=self._toggle_sidebar
+        ).pack(side="left", padx=(12,0))
         ctk.CTkLabel(hdr, text="Sayvo", fg_color="transparent",
-            text_color=TEXT, font=(F,15,"bold")).pack(side="left", padx=(22,0))
+            text_color=TEXT, font=(F,15,"bold")).pack(side="left", padx=(8,0))
         badge = ctk.CTkFrame(hdr, fg_color=ACCENT, corner_radius=4)
         badge.pack(side="left", padx=9, pady=17)
         ctk.CTkLabel(badge, text="PRO", fg_color="transparent",
             text_color="white", font=(F,7,"bold")).pack(padx=7, pady=2)
         self.eng_lbl = ctk.CTkLabel(hdr, text="", fg_color="transparent",
             text_color=DIM, font=(F,9)); self.eng_lbl.pack(side="left", padx=10)
+        # Mini record button — Start/Stop stays reachable with sidebar hidden
+        self.hdr_rec_btn = ctk.CTkButton(hdr, text="⏺", width=36, height=30,
+            fg_color=ACCENT, hover_color=ACCENT_HOV, text_color="white",
+            font=(F,12,"bold"), corner_radius=8, command=self._toggle)
+        self.hdr_rec_btn.pack(side="left", padx=(2,0))
+        ctk.CTkButton(hdr, text="🗑", width=36, height=30,
+            fg_color=BG3, hover_color=BG4, text_color=DIM,
+            font=(F,11), corner_radius=8, command=self._clear
+        ).pack(side="left", padx=(8,0))
 
         ctk.CTkCheckBox(hdr, text="Debug", variable=self.show_debug,
             fg_color=ACCENT, hover_color=BG4, text_color=DIM, font=(F,9),
             command=self._toggle_debug, corner_radius=4, border_color=BORDER,
             checkmark_color="white", checkbox_width=16, checkbox_height=16
         ).pack(side="right", padx=(0,20))
-        ctk.CTkButton(hdr, text="⚙", width=36, height=28,
+        ctk.CTkButton(hdr, text="⚙", width=38, height=30,
             fg_color=BG3, hover_color=BG4, text_color=TEXT, font=(F,12),
             corner_radius=8, command=self._open_settings
         ).pack(side="right", padx=(0,10))
-        ctk.CTkButton(hdr, text="📌  Facts", width=80, height=28,
+        ctk.CTkButton(hdr, text="📝  Notes", width=84, height=30,
+            fg_color=BG3, hover_color=BG4, text_color=TEXT, font=(F,9),
+            corner_radius=8, command=self._toggle_notes
+        ).pack(side="right", padx=(0,10))
+        ctk.CTkButton(hdr, text="📌  Facts", width=84, height=30,
             fg_color=BG3, hover_color=BG4, text_color=TEXT, font=(F,9),
             corner_radius=8, command=self._toggle_facts
         ).pack(side="right", padx=(0,10))
-        ctk.CTkButton(hdr, text="🗖  Overlay", width=86, height=28,
+        ctk.CTkButton(hdr, text="🗖  Overlay", width=90, height=30,
             fg_color=BG3, hover_color=BG4, text_color=TEXT, font=(F,9),
             corner_radius=8, command=self._toggle_overlay
         ).pack(side="right", padx=(0,10))
-        pill = ctk.CTkFrame(hdr, fg_color=BG3, corner_radius=999)
-        pill.pack(side="right", padx=6, pady=13)
+        pill = ctk.CTkFrame(hdr, fg_color=BG3, corner_radius=999,
+                            border_width=1, border_color=BORDER)
+        pill.pack(side="right", padx=6, pady=12)
+        self.hdr_dot = ctk.CTkLabel(pill, text="●", fg_color="transparent",
+            text_color=DIM, font=(F,9))
+        self.hdr_dot.pack(side="left", padx=(12,4), pady=3)
         self.hdr_status = ctk.CTkLabel(pill, text="Ready", fg_color="transparent",
             text_color=DIM, font=(F,9))
-        self.hdr_status.pack(padx=12, pady=3)
+        self.hdr_status.pack(side="left", padx=(0,12), pady=3)
 
         # ── Body ────────────────────────────────────────────────
         body = ctk.CTkFrame(self.root, fg_color=BG, corner_radius=0)
         body.pack(fill="both", expand=True)
 
-        sb = ctk.CTkFrame(body, fg_color=BG2, width=264, corner_radius=0)
-        sb.pack(side="left", fill="y"); sb.pack_propagate(False)
-        tk.Frame(body, bg=BORDER, width=1).pack(side="left", fill="y")
-        self._build_sb(sb)
+        self.sb_frame = ctk.CTkFrame(body, fg_color=BG2, width=264, corner_radius=0)
+        self.sb_frame.pack(side="left", fill="y"); self.sb_frame.pack_propagate(False)
+        self._sb_border = tk.Frame(body, bg=BORDER, width=1)
+        self._sb_border.pack(side="left", fill="y")
+        self._build_sb(self.sb_frame)
 
-        mid = ctk.CTkFrame(body, fg_color=BG, corner_radius=0)
-        mid.pack(side="left", fill="both", expand=True)
-        self._build_mid(mid)
+        self.mid_frame = ctk.CTkFrame(body, fg_color=BG, corner_radius=0)
+        self.mid_frame.pack(side="left", fill="both", expand=True)
+        self._build_mid(self.mid_frame)
 
         self.dbg_frame = ctk.CTkFrame(body, fg_color=BG2, width=340, corner_radius=0)
         self.dbg_frame.pack_propagate(False)
@@ -1455,6 +1638,11 @@ class App:
         self.facts_frame = ctk.CTkFrame(body, fg_color=BG2, width=260, corner_radius=0)
         self.facts_frame.pack_propagate(False)
         self._build_facts(self.facts_frame)
+
+        self._notes_visible = False
+        self.notes_frame = ctk.CTkFrame(body, fg_color=BG2, width=290, corner_radius=0)
+        self.notes_frame.pack_propagate(False)
+        self._build_notes(self.notes_frame)
         if self.show_debug.get():
             self.dbg_frame.pack(side="right", fill="y")
 
@@ -1487,24 +1675,30 @@ class App:
             corner_radius=4, border_color=BORDER, checkmark_color="white",
             checkbox_width=16, checkbox_height=16
         ).pack(anchor="w", pady=2)
+        ctk.CTkCheckBox(opts, text="Split view (side-by-side)", variable=self.twocol_var,
+            fg_color=ACCENT, hover_color=BG4, text_color=DIM, font=(F,9),
+            command=self._toggle_view,
+            corner_radius=4, border_color=BORDER, checkmark_color="white",
+            checkbox_width=16, checkbox_height=16
+        ).pack(anchor="w", pady=2)
         ctk.CTkButton(bot, text="📄  Call Summary", fg_color=BG3,
-            hover_color=BG4, text_color=GREEN, font=(F,10), height=36,
+            hover_color=BG4, text_color=GREEN, font=(F,10), height=38,
             corner_radius=10, anchor="w",
             command=self._call_summary).pack(fill="x", pady=(0,6))
         ctk.CTkButton(bot, text="📂  Session History", fg_color=BG3,
-            hover_color=BG4, text_color=TEXT, font=(F,10), height=36,
+            hover_color=BG4, text_color=TEXT, font=(F,10), height=38,
             corner_radius=10, anchor="w",
             command=self._open_sessions).pack(fill="x", pady=(0,6))
         ctk.CTkButton(bot, text="📖  Glossary", fg_color=BG3,
-            hover_color=BG4, text_color=PURPLE, font=(F,10), height=36,
+            hover_color=BG4, text_color=PURPLE, font=(F,10), height=38,
             corner_radius=10, anchor="w",
             command=self._open_glossary).pack(fill="x", pady=(0,6))
         ctk.CTkButton(bot, text="⬇  Export Transcript", fg_color=BG3,
-            hover_color=BG4, text_color=TEXT, font=(F,10), height=36,
+            hover_color=BG4, text_color=TEXT, font=(F,10), height=38,
             corner_radius=10, anchor="w",
             command=self._export).pack(fill="x", pady=(0,6))
         ctk.CTkButton(bot, text="🗑  Clear", fg_color="transparent",
-            hover_color=BG3, text_color=DIM, font=(F,10), height=36,
+            hover_color=BG3, text_color=DIM, font=(F,10), height=38,
             corner_radius=10, anchor="w",
             command=self._clear).pack(fill="x")
 
@@ -1631,13 +1825,13 @@ class App:
 
     def _build_mid(self, mid):
         # ── LIVE zone (top) — floating rounded card ──────────────
-        live = ctk.CTkFrame(mid, fg_color=BG3, corner_radius=16,
+        live = ctk.CTkFrame(mid, fg_color=BG3, corner_radius=18,
                             border_width=1, border_color=BORDER)
-        live.pack(fill="x", side="top", padx=14, pady=(12, 6))
+        live.pack(fill="x", side="top", padx=16, pady=(14, 8))
 
         # ── Footer: confidence bar (bottom, packed before feed) ──
-        tk.Frame(mid, bg=BORDER, height=1).pack(side="bottom", fill="x")
-        cs = ctk.CTkFrame(mid, fg_color=BG2, corner_radius=0, height=34)
+        tk.Frame(mid, bg="#141a2b", height=1).pack(side="bottom", fill="x")
+        cs = ctk.CTkFrame(mid, fg_color=BG, corner_radius=0, height=32)
         cs.pack(side="bottom", fill="x"); cs.pack_propagate(False)
 
         # ── Transcript search ─────────────────────────────────────
@@ -1647,16 +1841,17 @@ class App:
         # is attached, which made this render as an unlabeled mystery bar.
         self.search_entry = ctk.CTkEntry(srch,
             placeholder_text="🔍  Search transcript…",
-            fg_color=BG3, text_color=TEXT, border_width=0, font=(F,10),
-            corner_radius=8, height=32)
+            fg_color=BG2, text_color=TEXT, border_width=1,
+            border_color=BORDER, font=(F,10),
+            corner_radius=10, height=34)
         self.search_entry.pack(side="left", fill="x", expand=True)
         self.search_entry.bind("<KeyRelease>", lambda e: self._rebuild())
         def _clear_search():
             self.search_entry.delete(0, "end")
             self._rebuild()
-        ctk.CTkButton(srch, text="✕", width=32, height=32,
-            fg_color=BG3, hover_color=BG4, text_color=DIM, font=(F,10),
-            corner_radius=8, command=_clear_search).pack(side="left", padx=(6,0))
+        ctk.CTkButton(srch, text="✕", width=34, height=34,
+            fg_color=BG2, hover_color=BG4, text_color=DIM, font=(F,10),
+            corner_radius=10, command=_clear_search).pack(side="left", padx=(8,0))
 
         # ── Bubble feed (expanding center) ───────────────────────
         self.feed = ctk.CTkScrollableFrame(mid, fg_color=BG, corner_radius=0,
@@ -1664,6 +1859,25 @@ class App:
         self.feed.pack(fill="both", expand=True, pady=(6,0))
         self._empty_lbl = None
         self.root.after(200, self._update_empty_state)
+
+        # ── Responsive text wrapping ──────────────────────────────
+        # Bubbles/live text re-wrap to the window width (split-screen!)
+        self._wrap = 850
+        self._col_wrap = 380
+        self._resize_job = None
+        self.root.bind("<Configure>", self._on_window_resize)
+        self.root.after(900, self._apply_wrap)
+
+        # Column-header strip (shown only in two-column mode)
+        self.col_hdr = ctk.CTkFrame(mid, fg_color="transparent")
+        ch = ctk.CTkFrame(self.col_hdr, fg_color="transparent")
+        ch.pack(fill="x")
+        ch.columnconfigure(0, weight=1, uniform="ch")
+        ch.columnconfigure(1, weight=1, uniform="ch")
+        ctk.CTkLabel(ch, text="ORIGINAL", fg_color="transparent",
+            text_color=DIM, font=(F,8,"bold")).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(ch, text="TRANSLATION", fg_color="transparent",
+            text_color=ACCENT, font=(F,8,"bold")).grid(row=0, column=1, sticky="w")
 
         # ── Smooth scrolling engine ───────────────────────────────
         # Disable CTk's chunky per-notch jumps on the feed canvas and
@@ -1743,6 +1957,21 @@ class App:
             scrollbar_button_color=BG3, scrollbar_button_hover_color=BG4)
         self.facts_list.pack(fill="both", expand=True, padx=8, pady=(0,10))
 
+    def _toggle_sidebar(self):
+        """Collapse/restore the left sidebar — for split-screen / vertical
+        layouts where only the conversation matters."""
+        self._sb_hidden = not getattr(self, "_sb_hidden", False)
+        if self._sb_hidden:
+            self.sb_frame.pack_forget()
+            self._sb_border.pack_forget()
+        else:
+            self._sb_border.pack(side="left", fill="y",
+                                 before=self.mid_frame)
+            self.sb_frame.pack(side="left", fill="y",
+                               before=self._sb_border)
+        self._settings["sidebar_hidden"] = self._sb_hidden
+        self._save_settings()
+
     def _toggle_facts(self):
         self._facts_visible = not self._facts_visible
         if self._facts_visible:
@@ -1751,7 +1980,8 @@ class App:
             self.facts_frame.pack_forget()
 
     def _add_facts(self, pairs):
-        added = False
+        # Collect facts silently — the panel opens only when the user clicks
+        # 📌 Facts (auto-opening mid-call caused a layout hitch).
         for icon, val in pairs:
             if val in self._facts: continue
             self._facts[val] = icon
@@ -1760,10 +1990,6 @@ class App:
                 font=(FM,10), height=30, corner_radius=8, anchor="w",
                 command=lambda v=val: self._copy_fact(v)
                 ).pack(fill="x", pady=2, padx=2)
-            added = True
-        # auto-open the panel the first time a fact appears
-        if added and not self._facts_visible and len(self._facts) <= len(pairs):
-            self._toggle_facts()
 
     def _copy_fact(self, val):
         try:
@@ -1774,6 +2000,84 @@ class App:
     def _clear_facts(self):
         self._facts.clear()
         for w in self.facts_list.winfo_children(): w.destroy()
+
+    def _build_notes(self, frm):
+        tk.Frame(frm, bg=BORDER, width=1).pack(side="left", fill="y")
+        inner = ctk.CTkFrame(frm, fg_color=BG2, corner_radius=0)
+        inner.pack(side="left", fill="both", expand=True)
+        top = ctk.CTkFrame(inner, fg_color="transparent")
+        top.pack(fill="x", padx=14, pady=(16,6))
+        ctk.CTkLabel(top, text="📝 Notes", fg_color="transparent",
+            text_color=TEXT, font=(F,12,"bold")).pack(side="left")
+        ctk.CTkButton(top, text="Clear", width=48, height=24,
+            fg_color="transparent", hover_color=BG3, text_color=DIM,
+            font=(F,8), corner_radius=6,
+            command=self._clear_notes).pack(side="right")
+
+        ctk.CTkLabel(inner, text="QUICK FIELDS", fg_color="transparent",
+            text_color=DIM, font=(F,8,"bold")).pack(anchor="w", padx=14, pady=(6,4))
+        def qf(icon, ph):
+            r = ctk.CTkFrame(inner, fg_color="transparent")
+            r.pack(fill="x", padx=12, pady=2)
+            ctk.CTkLabel(r, text=icon, fg_color="transparent",
+                text_color=DIM, font=(F,10), width=18).pack(side="left")
+            e = ctk.CTkEntry(r, placeholder_text=ph,
+                fg_color=BG3, text_color=TEXT, border_width=0, font=(F,10),
+                corner_radius=8, height=30)
+            e.pack(side="left", fill="x", expand=True, padx=(4,0))
+            return e
+        self.qf_claim = qf("#",  "Claim / reference #")
+        self.qf_alert = qf("⚠",  "Allergy / alert")
+        self.qf_appt  = qf("🕐", "Callback / appt time")
+
+        ctk.CTkLabel(inner, text="FREE NOTES", fg_color="transparent",
+            text_color=DIM, font=(F,8,"bold")).pack(anchor="w", padx=14, pady=(12,4))
+        self.notes_box = ctk.CTkTextbox(inner, fg_color=BG3, text_color=TEXT,
+            font=(F,11), corner_radius=10, wrap="word")
+        self.notes_box.pack(fill="both", expand=True, padx=12, pady=(0,8))
+        ctk.CTkLabel(inner,
+            text="Saved with the session & included in Export.",
+            fg_color="transparent", text_color=DIM, font=(F,8)
+            ).pack(anchor="w", padx=14, pady=(0,10))
+
+    def _toggle_notes(self):
+        self._notes_visible = not self._notes_visible
+        if self._notes_visible:
+            self.notes_frame.pack(side="right", fill="y")
+        else:
+            self.notes_frame.pack_forget()
+
+    def _clear_notes(self):
+        try:
+            for e in (self.qf_claim, self.qf_alert, self.qf_appt):
+                e.delete(0, "end")
+            self.notes_box.delete("1.0", "end")
+        except Exception: pass
+
+    def _autofill_notes(self, pairs):
+        # Detected facts flow into the Quick Fields — but only into EMPTY
+        # fields, never overwriting what the user typed.
+        try:
+            for icon, val in pairs:
+                if icon == "#" and not self.qf_claim.get().strip():
+                    self.qf_claim.insert(0, val)
+                elif icon == "📅" and not self.qf_appt.get().strip():
+                    self.qf_appt.insert(0, val)
+        except Exception:
+            pass
+
+    def _notes_snapshot(self):
+        # Returns a list of non-empty note lines, or [] if nothing written.
+        out = []
+        try:
+            if self.qf_claim.get().strip(): out.append("Claim / Ref #: " + self.qf_claim.get().strip())
+            if self.qf_alert.get().strip(): out.append("Allergy / Alert: " + self.qf_alert.get().strip())
+            if self.qf_appt.get().strip():  out.append("Callback / Appt: " + self.qf_appt.get().strip())
+            free = self.notes_box.get("1.0", "end").strip()
+            if free: out.append("Notes:\n" + free)
+        except Exception:
+            pass
+        return out
 
     def _build_dbg(self, frm):
         tk.Frame(frm, bg=BORDER, width=1).pack(side="left", fill="y")
@@ -1906,6 +2210,24 @@ class App:
             pass
         self.root.after(16, self._pan_loop)
 
+    def _reset_feed_view(self):
+        """After clearing, the canvas briefly remembers the OLD content
+        height — the view parks in empty blackness and new bubbles appear
+        far above it. Recompute the real region and snap to the top; run
+        again after layout settles to catch the late shrink."""
+        try:
+            if self._scroll_job:
+                self.root.after_cancel(self._scroll_job)
+                self._scroll_job = None
+            self._scroll_target = None
+            self.root.update_idletasks()
+            cv = self.feed._parent_canvas
+            bbox = cv.bbox("all") or (0, 0, 0, 1)
+            cv.configure(scrollregion=bbox)
+            cv.yview_moveto(0.0)
+        except Exception:
+            pass
+
     def _scroll_feed_to_bottom(self):
         self.root.update_idletasks()
         try:
@@ -1922,15 +2244,18 @@ class App:
     def _load_devices(self):
         try: self.devices = list_input_devices()
         except Exception as e: self.log.log(f"Device scan error: {e}","ERROR"); return
-        names = []; best = 0
+        names = []; best = None
         for i, d in enumerate(self.devices):
             if d.get("is_output_loopback"):
                 names.append(f"🔊 {d['name']} — what you hear")
             else:
                 tag = " VB-Cable" if d["is_vbcable"] else " Loopback" if d["is_loopback"] else ""
                 names.append(f"[{d['index']}] {d['name']}{tag}")
-            if d["is_vbcable"] and not any(self.devices[j]["is_vbcable"] for j in range(i)):
+            if best is None and d["is_vbcable"]:
                 best = i
+        if best is None:   # no VB-Cable → prefer a what-you-hear device over a mic
+            best = next((i for i, d in enumerate(self.devices)
+                         if d.get("is_output_loopback")), 0)
         # Restore the device used last session (overrides auto-pick)
         saved = self._settings.get("device_name", "")
         if saved:
@@ -1974,6 +2299,8 @@ class App:
 
     # ── Record ───────────────────────────────────────────────────
     def _toggle(self):
+        if getattr(self, "_connecting", False):
+            return              # ignore clicks while a connection is in flight
         if self.recording: self._stop()
         else:              self._start()
 
@@ -1988,6 +2315,7 @@ class App:
         dev = self.devices[idx]
         src = self.src_lang_var.get()
 
+        self._connecting = True
         self.rec_btn.configure(state="disabled", text="Connecting…")
         self.pipe_lbl.configure(text="Connecting to Deepgram…", text_color=YELLOW)
         self.hdr_status.configure(text="Connecting…", text_color=YELLOW)
@@ -2020,6 +2348,7 @@ class App:
         return dev
 
     def _finish_start(self):
+        self._connecting = False
         dev = self._resolve_device(self._pending_dev)
         self._cap = AudioCapture(dev["index"], self._on_chunk, self._on_level, self.log,
                                  prefer_direct=dev.get("is_loopback", False),
@@ -2062,6 +2391,7 @@ class App:
         self.hdr_status.configure(text="Recording", text_color=GREEN)
 
     def _connect_failed(self):
+        self._connecting = False
         self.rec_btn.configure(state="normal", text="⏺  Start Listening",
             fg_color=ACCENT, hover_color=ACCENT_HOV, text_color="white")
         self.pipe_lbl.configure(text="Connection failed — check Debug log", text_color=RED)
@@ -2081,6 +2411,15 @@ class App:
         if self._grace_timer:
             self.root.after_cancel(self._grace_timer); self._grace_timer = None
         self._para_flush()   # flush remaining buffer → Claude thread takes care of it
+        # Persist notes alongside the session cache
+        try:
+            notes = self._notes_snapshot()
+            if notes and self._session_file:
+                np = Path(self._session_file.name).with_suffix("")
+                Path(str(np) + "_notes.txt").write_text(
+                    "\n".join(notes), encoding="utf-8")
+        except Exception:
+            pass
         # Close session cache
         if self._session_file:
             try: self._session_file.close()
@@ -2164,6 +2503,29 @@ class App:
                     self.live_dot.configure(text_color=ACCENT)
         except queue.Empty:
             pass
+
+        # Breathing LIVE dot while recording (~0.8s cycle) + pill dot sync
+        self._pulse = getattr(self, "_pulse", 0) + 1
+        if self._pulse % 12 == 0:
+            try:
+                if self.recording and not self._privacy:
+                    cur = self.live_dot.cget("text_color")
+                    self.live_dot.configure(
+                        text_color="#3a4c8f" if cur == ACCENT else ACCENT)
+                self.hdr_dot.configure(
+                    text_color=self.hdr_status.cget("text_color"))
+            except Exception: pass
+
+        if getattr(self, "_hdr_rec_state", None) != self.recording:
+            self._hdr_rec_state = self.recording
+            try:
+                if self.recording:
+                    self.hdr_rec_btn.configure(text="⏹", fg_color=RED,
+                                               hover_color=RED_HOV)
+                else:
+                    self.hdr_rec_btn.configure(text="⏺", fg_color=ACCENT,
+                                               hover_color=ACCENT_HOV)
+            except Exception: pass
 
         if self.recording and self.session_start:
             e = int(time.time() - self.session_start)
@@ -2445,8 +2807,10 @@ class App:
             pid = f"para_{self._bubble_count:04d}"
         self._current_partial = ""
 
-        # Apply phone formatter to the full buffer — digits often arrive across
-        # multiple separate finals so per-final formatting never sees the whole number
+        # Re-apply formatters on the full buffer — numbers often arrive split
+        # across separate finals ("doscientos cincuenta" | "y tres")
+        text = _compound_numbers_to_digits(text)
+        text = _format_currency(text)
         text = _format_phone(text)
 
         # Clear the LIVE workspace instantly
@@ -2490,21 +2854,22 @@ class App:
             daemon=True
         ).start()
 
-    def _row_slot(self, p: Phrase):
-        """Create a bubble card immediately with the transcribed text and a
-        'translating…' placeholder. Returns the translation CTkLabel so the
-        background thread can fill it in when Claude responds.
-        Returns None if show_tr is off (no translation label needed)."""
+    def _bubble_card(self, p, live=False):
+        # One renderer for both the live reserved-slot (live=True, returns a
+        # placeholder tr_lbl the worker fills) and static rebuilds (live=False,
+        # translation + fact-chips drawn immediately). Responsive: two columns
+        # (original | translation) when wide, stacked when narrow/vertical.
         ts_str    = time.strftime("%H:%M", time.localtime(p.ts))
         code_a, code_b = self._pair_codes()
         lang_full = TRANS_NAME.get(p.lang, p.lang.upper() if p.lang else "Unknown")
         lang_col  = ACCENT if p.lang == code_a else (PURPLE if p.lang == code_b else DIM)
         bg_col    = BUBBLE_EN if p.lang == code_a else (BUBBLE_ES if p.lang == code_b else BUBBLE_OTH)
+        show_tr   = self.show_tr.get()
+        two       = getattr(self, "_twocol", False) and show_tr and not getattr(self, "_narrow", False)
 
-        bubble = ctk.CTkFrame(self.feed, fg_color=bg_col, corner_radius=14,
-                              border_width=1, border_color=BORDER)
+        bubble = ctk.CTkFrame(self.feed, fg_color=bg_col, corner_radius=16,
+                              border_width=1, border_color="#1e2742")
         bubble.pack(fill="x", padx=22, pady=(0, 12))
-        # Colored accent stripe (language identity at a glance)
         ctk.CTkFrame(bubble, fg_color=lang_col, width=4, height=10, corner_radius=2
             ).pack(side="left", fill="y", padx=(12,0), pady=12)
         body = ctk.CTkFrame(bubble, fg_color="transparent")
@@ -2512,38 +2877,74 @@ class App:
 
         hdr = ctk.CTkFrame(body, fg_color="transparent")
         hdr.pack(fill="x", padx=14, pady=(12, 4))
-        ctk.CTkLabel(hdr, text=f"● {lang_full}",
-            fg_color="transparent", text_color=lang_col,
-            font=(F,9,"bold")).pack(side="left", padx=(0,6))
-        ctk.CTkLabel(hdr, text=ts_str,
-            fg_color="transparent", text_color=DIM, font=(FM,8)).pack(side="left")
+        ctk.CTkLabel(hdr, text=f"● {lang_full}", fg_color="transparent",
+            text_color=lang_col, font=(F,9,"bold")).pack(side="left", padx=(0,6))
+        ctk.CTkLabel(hdr, text=ts_str, fg_color="transparent",
+            text_color=DIM, font=(FM,8)).pack(side="left")
         cbtn = ctk.CTkButton(hdr, text="⧉", width=26, height=22,
             fg_color="transparent", hover_color=BG4, text_color=DIM,
             font=(F,10), corner_radius=6,
             command=lambda pid=p.id: self._copy_bubble(pid, "translation"))
         cbtn.pack(side="right")
-        cbtn.bind("<Button-3>",
-            lambda e, pid=p.id: self._copy_bubble(pid, "original"))
-        # Engine chip — filled in when the translation lands (Claude / Google)
-        eng_lbl = ctk.CTkLabel(hdr, text="",
-            fg_color="transparent", text_color=DIM, font=(F,8))
+        cbtn.bind("<Button-3>", lambda e, pid=p.id: self._copy_bubble(pid, "original"))
+        eng_lbl = ctk.CTkLabel(hdr, text="", fg_color="transparent",
+            text_color=DIM, font=(F,8))
         eng_lbl.pack(side="right", padx=(0,4))
 
-        ctk.CTkLabel(body, text=p.text,
-            fg_color="transparent", text_color="#93a3c8",
-            font=(F,12+self._fs), anchor="w", justify="left",
-            wraplength=850).pack(fill="x", padx=14, pady=(0,6))
+        # Translation OFF → original only, full width
+        if not show_tr:
+            ctk.CTkLabel(body, text=p.text, fg_color="transparent",
+                text_color="#b8c4e0", font=(F,12+self._fs), anchor="w",
+                justify="left", wraplength=self._wrap
+                ).pack(fill="x", padx=14, pady=(0,10))
+            return bubble, None, eng_lbl
 
-        if self.show_tr.get():
-            tr_lbl = ctk.CTkLabel(body, text="⟳  Translating…",
-                fg_color="transparent", text_color=DIM,
-                font=(F,15+self._fs,"bold"), anchor="w", justify="left",
-                wraplength=850)
-            tr_lbl.pack(fill="x", padx=14, pady=(0,14))
-            return tr_lbl, eng_lbl
+        tr_text  = "⟳  Translating…" if live else (p.translation or "")
+        tr_color = DIM if (live or not p.translation) else TEXT
+
+        if two:
+            content = ctk.CTkFrame(body, fg_color="transparent")
+            content.pack(fill="x", padx=14, pady=(0,12))
+            content.columnconfigure(0, weight=1, uniform="cc")
+            content.columnconfigure(2, weight=1, uniform="cc")
+            ctk.CTkLabel(content, text=p.text, fg_color="transparent",
+                text_color="#93a3c8", font=(F,12+self._fs), anchor="nw",
+                justify="left", wraplength=self._col_wrap
+                ).grid(row=0, column=0, sticky="new", padx=(0,12))
+            tk.Frame(content, bg="#232c48", width=1).grid(row=0, column=1, sticky="ns")
+            tr_col = ctk.CTkFrame(content, fg_color="transparent")
+            tr_col.grid(row=0, column=2, sticky="new", padx=(12,0))
+            tr_lbl = ctk.CTkLabel(tr_col, text=tr_text, fg_color="transparent",
+                text_color=tr_color, font=(F,14+self._fs,"bold"), anchor="nw",
+                justify="left", wraplength=self._col_wrap)
+            tr_lbl.pack(fill="x", anchor="w")
         else:
-            ctk.CTkFrame(body, fg_color="transparent", height=8).pack()
-            return None, eng_lbl
+            ctk.CTkLabel(body, text=p.text, fg_color="transparent",
+                text_color="#93a3c8", font=(F,12+self._fs), anchor="w",
+                justify="left", wraplength=self._wrap
+                ).pack(fill="x", padx=14, pady=(0,6))
+            tr_lbl = ctk.CTkLabel(body, text=tr_text, fg_color="transparent",
+                text_color=tr_color, font=(F,15+self._fs,"bold"), anchor="w",
+                justify="left", wraplength=self._wrap)
+            tr_lbl.pack(fill="x", padx=14, pady=(0,14))
+
+        # Static render → draw fact-chips now (live path adds them on fill)
+        if not live and p.translation:
+            pairs = _extract_facts(p.text + " " + p.translation)
+            if pairs:
+                row = ctk.CTkFrame(tr_lbl.master, fg_color="transparent")
+                row.pack(fill="x", pady=(0,10), padx=(0 if two else 14))
+                for icon, val in pairs[:4]:
+                    ctk.CTkButton(row, text=f"{icon} {val}", fg_color=BG4,
+                        hover_color=BG3, text_color=ACCENT, font=(FM,9),
+                        height=24, corner_radius=6,
+                        command=lambda v=val: self._copy_fact(v)
+                        ).pack(side="left", padx=(0,6))
+        return bubble, tr_lbl, eng_lbl
+
+    def _row_slot(self, p: Phrase):
+        _, tr_lbl, eng_lbl = self._bubble_card(p, live=True)
+        return tr_lbl, eng_lbl
 
     def _translate_and_push_bubble(self, text: str, lang: str, conf: float,
                                     ts: float, speaker: int, pid: str, tr_lbl, eng_lbl=None):
@@ -2616,7 +3017,14 @@ class App:
             try:
                 tr_lbl.configure(text=tr, text_color=TEXT)
             except Exception:
-                pass  # widget was destroyed (e.g. after _clear())
+                # Widget destroyed (resize rebuild / 120-cap prune / clear).
+                # The translation IS stored in committed — re-render soon so
+                # it appears instead of silently vanishing.
+                if pid in self.committed:
+                    if getattr(self, "_refill_job", None):
+                        try: self.root.after_cancel(self._refill_job)
+                        except Exception: pass
+                    self._refill_job = self.root.after(120, self._refill_done)
 
         self._overlay_last(tr)
 
@@ -2636,6 +3044,7 @@ class App:
         pairs = _extract_facts(text + " " + (tr or ""))
         if pairs:
             self._add_facts(pairs)
+            self._autofill_notes(pairs)
             # small copy-chips inside the bubble too (max 4)
             if tr_lbl is not None:
                 try:
@@ -2662,6 +3071,10 @@ class App:
         # Persist to disk
         if pid in self.committed:
             self._session_write(self.committed[pid])
+
+    def _refill_done(self):
+        self._refill_job = None
+        self._rebuild()
 
     def _needs_claude(self, text: str, conf: float, domain: str) -> bool:
         """Balanced mode: route to Claude only when quality actually matters.
@@ -2757,53 +3170,56 @@ class App:
     # Bubble rendering
     # ══════════════════════════════════════════════════════════════
     def _row(self, p: Phrase):
-        """Create a polished bubble card in the scrollable feed."""
-        ts        = time.strftime("%H:%M", time.localtime(p.ts))
-        code_a, code_b = self._pair_codes()
-        lang_full = TRANS_NAME.get(p.lang, p.lang.upper() if p.lang else "Unknown")
-        lang_col  = ACCENT if p.lang == code_a else (PURPLE if p.lang == code_b else DIM)
-        bg_col    = BUBBLE_EN if p.lang == code_a else (BUBBLE_ES if p.lang == code_b else BUBBLE_OTH)
-
-        bubble = ctk.CTkFrame(self.feed, fg_color=bg_col, corner_radius=14,
-                              border_width=1, border_color=BORDER)
-        bubble.pack(fill="x", padx=22, pady=(0, 12))
-        ctk.CTkFrame(bubble, fg_color=lang_col, width=4, height=10, corner_radius=2
-            ).pack(side="left", fill="y", padx=(12,0), pady=12)
-        body = ctk.CTkFrame(bubble, fg_color="transparent")
-        body.pack(side="left", fill="both", expand=True)
-
-        # ── Header: language chip · timestamp ────────────────────
-        hdr = ctk.CTkFrame(body, fg_color="transparent")
-        hdr.pack(fill="x", padx=14, pady=(12, 4))
-        ctk.CTkLabel(hdr, text=f"● {lang_full}",
-            fg_color="transparent", text_color=lang_col,
-            font=(F,9,"bold")).pack(side="left", padx=(0,6))
-        ctk.CTkLabel(hdr, text=ts,
-            fg_color="transparent", text_color=DIM, font=(FM,8)).pack(side="left")
-        cbtn = ctk.CTkButton(hdr, text="⧉", width=26, height=22,
-            fg_color="transparent", hover_color=BG4, text_color=DIM,
-            font=(F,10), corner_radius=6,
-            command=lambda pid=p.id: self._copy_bubble(pid, "translation"))
-        cbtn.pack(side="right")
-        cbtn.bind("<Button-3>",
-            lambda e, pid=p.id: self._copy_bubble(pid, "original"))
-
-        # ── Source transcript ────────────────────────────────────
-        ctk.CTkLabel(body, text=p.text,
-            fg_color="transparent", text_color="#93a3c8",
-            font=(F,12+self._fs), anchor="w", justify="left",
-            wraplength=850).pack(fill="x", padx=14, pady=(0,6))
-
-        # ── Translation (Claude-polished) ────────────────────────
-        if self.show_tr.get() and p.translation:
-            ctk.CTkLabel(body, text=p.translation,
-                fg_color="transparent", text_color=TEXT,
-                font=(F,15+self._fs,"bold"), anchor="w", justify="left",
-                wraplength=850).pack(fill="x", padx=14, pady=(0,14))
-        else:
-            ctk.CTkFrame(body, fg_color="transparent", height=8).pack()
-
+        bubble, _, _ = self._bubble_card(p, live=False)
         return bubble
+
+    def _on_window_resize(self, event=None):
+        if self._resize_job:
+            try: self.root.after_cancel(self._resize_job)
+            except Exception: pass
+        self._resize_job = self.root.after(350, self._apply_wrap)
+
+    def _apply_wrap(self):
+        # Recompute wrap widths on resize. IMPORTANT: this never flips the
+        # split/stacked LAYOUT (that flip fed a resize->rebuild->resize loop
+        # that froze the app). Layout is a user toggle; here we only size text
+        # and auto-stack when the window is genuinely too narrow for columns.
+        self._resize_job = None
+        if self._rebuilding:
+            return
+        try:
+            w = self.feed.winfo_width()
+            if w < 50: return
+            try:
+                scale = float(ctk.ScalingTracker.get_widget_scaling(self.feed))
+                if not scale or scale <= 0: scale = 1.0
+            except Exception:
+                scale = 1.0
+            avail     = w / scale
+            new_wrap  = max(260, int(avail - 110))
+            col_wrap  = max(200, int((avail - 150) / 2))
+            live_wrap = max(260, int(avail - 60))
+            narrow    = avail < 780
+            self.live_confirmed.configure(wraplength=live_wrap)
+            self.live_partial.configure(wraplength=live_wrap)
+            self.live_tr.configure(wraplength=live_wrap)
+            changed = (abs(new_wrap - self._wrap) > 50
+                       or abs(col_wrap - getattr(self, "_col_wrap", 0)) > 50
+                       or narrow != self._narrow)
+            self._wrap = new_wrap
+            self._col_wrap = col_wrap
+            self._narrow = narrow
+            if changed:
+                self._rebuild()
+        except Exception:
+            pass
+
+    def _toggle_view(self):
+        # User flips split/stacked from the sidebar checkbox.
+        self._twocol = bool(self.twocol_var.get())
+        self._settings["twocol"] = self._twocol
+        self._save_settings()
+        self._rebuild()
 
     def _update_empty_state(self):
         """Friendly hint in the feed when there's nothing to show yet."""
@@ -2814,27 +3230,70 @@ class App:
             self._empty_lbl = None
         elif not has_bubbles and self._empty_lbl is None:
             try:
-                self._empty_lbl = ctk.CTkLabel(self.feed,
+                wrap = ctk.CTkFrame(self.feed, fg_color="transparent")
+                img = self._empty_logo()
+                if img is not None:
+                    ctk.CTkLabel(wrap, image=img, text="",
+                                 fg_color="transparent").pack(pady=(70,18))
+                    pad_top = 0
+                else:
+                    pad_top = 120
+                ctk.CTkLabel(wrap,
                     text=("Your conversation will appear here\n\n"
                           "▶  Press  ⏺ Start Listening  when your call begins"),
                     fg_color="transparent", text_color=DIM, font=(F,13),
-                    justify="center")
-                self._empty_lbl.pack(pady=120)
+                    justify="center").pack(pady=(pad_top,0))
+                wrap.pack()
+                self._empty_lbl = wrap
             except Exception:
                 self._empty_lbl = None
 
+    def _empty_logo(self):
+        """Dimmed 72px Sayvo mark for the empty feed. Cached; None on failure."""
+        if hasattr(self, "_empty_logo_img"):
+            return self._empty_logo_img
+        self._empty_logo_img = None
+        try:
+            from PIL import Image
+            p = self._icon_path()
+            if p:
+                im = Image.open(p)
+                try: im.size = (256, 256)   # pick the largest ico frame
+                except Exception: pass
+                im = im.convert("RGBA").resize((72, 72), Image.LANCZOS)
+                a = im.getchannel("A").point(lambda v: int(v * 0.35))
+                im.putalpha(a)
+                self._empty_logo_img = ctk.CTkImage(im, size=(72, 72))
+        except Exception:
+            self._empty_logo_img = None
+        return self._empty_logo_img
+
     def _rebuild(self):
-        try:    q = self.search_entry.get().strip().lower()
-        except Exception: q = ""
-        for w in self.feed.winfo_children(): w.destroy()
-        matches = [p for p in self.committed.values()
-                   if not q or q in p.text.lower()
-                   or q in (p.translation or "").lower()]
-        self._empty_lbl = None   # destroyed with the other children above
-        for p in matches[-120:]:   # canvas safety cap — newest 120
-            self._row(p)
-        self._update_empty_state()
-        if self.autoscroll.get(): self._scroll_feed_to_bottom()
+        if self._rebuilding:      # never re-enter (kills any resize loop)
+            return
+        self._rebuilding = True
+        try:
+            try:    q = self.search_entry.get().strip().lower()
+            except Exception: q = ""
+            for w in self.feed.winfo_children(): w.destroy()
+            matches = [p for p in self.committed.values()
+                       if not q or q in p.text.lower()
+                       or q in (p.translation or "").lower()]
+            self._empty_lbl = None   # destroyed with the other children above
+            for p in matches[-120:]:   # canvas safety cap — newest 120
+                self._row(p)
+            self._update_empty_state()
+            # ORIGINAL | TRANSLATION header only when actually two-column
+            two = (self._twocol and self.show_tr.get() and not self._narrow)
+            try:
+                if two:
+                    self.col_hdr.pack(fill="x", padx=40, pady=(2,0), before=self.feed)
+                else:
+                    self.col_hdr.pack_forget()
+            except Exception: pass
+            if self.autoscroll.get(): self._scroll_feed_to_bottom()
+        finally:
+            self._rebuilding = False
 
     # ── Glossary manager ─────────────────────────────────────────
     def _open_glossary(self):
@@ -2917,7 +3376,7 @@ class App:
                 refresh()
 
         ctk.CTkButton(add, text="Add Term", fg_color=ACCENT,
-            hover_color="#4a5de0", text_color="white",
+            hover_color=ACCENT_HOV, text_color="white",
             font=(F,10,"bold"), height=36, corner_radius=8,
             command=add_term).pack(fill="x", padx=12, pady=(0,12))
 
@@ -3131,9 +3590,15 @@ class App:
             ).pack(anchor="w", pady=(6,14))
 
         finish_btn.pack(fill="x", padx=26, pady=(8,6))
-        ctk.CTkButton(win, text="Skip for now", fg_color="transparent",
-            hover_color=BG3, text_color=DIM, font=(F,9), height=28,
-            corner_radius=8, command=win.destroy).pack(pady=(0,14))
+        def _skip():
+            # Don't nag on every launch — setup can be re-run from ⚙ Settings
+            self._settings["wizard_done"] = True
+            self._save_settings()
+            win.destroy()
+        ctk.CTkButton(win, text="Skip — I'll set up later (⚙ Settings)",
+            fg_color="transparent", hover_color=BG3, text_color=DIM,
+            font=(F,9), height=28, corner_radius=8,
+            command=_skip).pack(pady=(0,14))
 
     def _wiz_test_audio(self, wiz_combo, result_lbl):
         i = wiz_combo.current()
@@ -3211,9 +3676,17 @@ class App:
                 "console.anthropic.com — without it Sayvo uses Google only",
                 self.anthropic_key_var, self._save_anthropic_key, PURPLE)
 
+        ctk.CTkButton(win, text="🧙  Run Setup Wizard again",
+            fg_color=BG3, hover_color=BG4, text_color=TEXT, font=(F,10),
+            height=36, corner_radius=10,
+            command=lambda: (win.destroy(), self._show_wizard())
+            ).pack(fill="x", padx=26, pady=(14,0))
         ctk.CTkButton(win, text="Close", fg_color=BG2, hover_color=BG3,
             text_color=DIM, font=(F,10), height=36, corner_radius=10,
-            command=win.destroy).pack(fill="x", padx=26, pady=(16,18))
+            command=win.destroy).pack(fill="x", padx=26, pady=(10,6))
+        ctk.CTkLabel(win, text=f"Sayvo v{__version__}",
+            fg_color="transparent", text_color=DIM, font=(F,8)
+            ).pack(pady=(0,10))
 
     # ══════════════════════════════════════════════════════════════
     # One-click call summary
@@ -3285,54 +3758,130 @@ class App:
     # ══════════════════════════════════════════════════════════════
     # Session history browser
     # ══════════════════════════════════════════════════════════════
+    def _session_meta(self, f):
+        # (epoch_start, n_segments, duration_sec) for one session file.
+        try:
+            lines = [l for l in f.read_text(encoding="utf-8").splitlines() if l.strip()]
+        except Exception:
+            lines = []
+        n = len(lines)
+        try:
+            dt = time.mktime(time.strptime(f.stem.replace("session_",""), "%Y%m%d_%H%M%S"))
+        except Exception:
+            dt = f.stat().st_mtime if f.exists() else time.time()
+        dur = 0.0
+        if n >= 2:
+            try:
+                first = json.loads(lines[0]).get("ts", dt)
+                last  = json.loads(lines[-1]).get("ts", dt)
+                dur = max(0.0, float(last) - float(first))
+            except Exception:
+                dur = 0.0
+        return dt, n, dur
+
+    @staticmethod
+    def _fmt_dur(sec):
+        sec = int(sec)
+        if sec < 60: return f"{sec}s"
+        m, s = divmod(sec, 60)
+        if m < 60: return f"{m}m"
+        h, m = divmod(m, 60)
+        return f"{h}h {m}m"
+
     def _open_sessions(self):
         win = ctk.CTkToplevel(self.root)
         win.title("Session History")
         self._apply_icon(win)
-        win.geometry("660x540"); win.configure(fg_color=BG)
+        win.geometry("680x600"); win.configure(fg_color=BG)
         win.grab_set()
         ctk.CTkLabel(win, text="Session History",
             fg_color="transparent", text_color=TEXT,
             font=(F,15,"bold")).pack(anchor="w", padx=24, pady=(18,2))
         ctk.CTkLabel(win, text="Every recording is auto-saved. Open one to review it in the feed.",
-            fg_color="transparent", text_color=DIM, font=(F,9)).pack(anchor="w", padx=24, pady=(0,10))
-        scroll = ctk.CTkScrollableFrame(win, fg_color=BG2, corner_radius=12)
-        scroll.pack(fill="both", expand=True, padx=22, pady=(0,18))
+            fg_color="transparent", text_color=DIM, font=(F,9)).pack(anchor="w", padx=24, pady=(0,8))
 
         sdir  = Path.home()/".interpro"/"sessions"
         files = sorted(sdir.glob("session_*.jsonl"), reverse=True) if sdir.exists() else []
-        shown = 0
-        for f in files[:80]:
-            try:
-                n = sum(1 for l in f.read_text(encoding="utf-8").splitlines() if l.strip())
-            except Exception:
-                n = 0
-            if n == 0: continue
-            shown += 1
-            try:
-                dt = time.strptime(f.stem.replace("session_",""), "%Y%m%d_%H%M%S")
-                when = time.strftime("%b %d, %Y  %H:%M", dt)
-            except Exception:
-                when = f.stem
-            row = ctk.CTkFrame(scroll, fg_color=BG3, corner_radius=10)
-            row.pack(fill="x", pady=4, padx=8)
-            ctk.CTkLabel(row, text=when, fg_color="transparent",
-                text_color=TEXT, font=(F,11,"bold")).pack(side="left", padx=(14,8), pady=12)
-            ctk.CTkLabel(row, text=f"{n} segments", fg_color="transparent",
-                text_color=DIM, font=(F,9)).pack(side="left")
-            ctk.CTkButton(row, text="✕", width=30, height=28,
-                fg_color="transparent", hover_color=RED, text_color=DIM,
-                font=(F,10,"bold"), corner_radius=6,
-                command=lambda p=f, r=row: (p.unlink(missing_ok=True), r.destroy())
-                ).pack(side="right", padx=(4,10))
-            ctk.CTkButton(row, text="Open", width=64, height=28,
-                fg_color=ACCENT, hover_color=ACCENT_HOV, text_color="white",
-                font=(F,9,"bold"), corner_radius=6,
-                command=lambda p=f: self._load_session(p, win)
-                ).pack(side="right", padx=4)
-        if shown == 0:
-            ctk.CTkLabel(scroll, text="No saved sessions yet — they appear after your first recording.",
-                fg_color="transparent", text_color=DIM, font=(F,10)).pack(pady=30)
+        meta  = []
+        for f in files[:200]:
+            dt, n, dur = self._session_meta(f)
+            if n > 0:
+                meta.append((f, dt, n, dur))
+
+        period_var = tk.StringVar(value="Today")
+        tabs = ctk.CTkSegmentedButton(win, values=["Today","Week","Month","All"],
+            variable=period_var, fg_color=BG2, selected_color=ACCENT,
+            selected_hover_color=ACCENT_HOV, unselected_color=BG3,
+            unselected_hover_color=BG4, text_color=TEXT, font=(F,10),
+            command=lambda *_: render())
+        tabs.pack(fill="x", padx=22, pady=(4,8))
+
+        stats = ctk.CTkFrame(win, fg_color=BG2, corner_radius=12)
+        stats.pack(fill="x", padx=22, pady=(0,8))
+        stats.columnconfigure((0,1,2), weight=1)
+        def stat_tile(col, accent):
+            f = ctk.CTkFrame(stats, fg_color="transparent")
+            f.grid(row=0, column=col, sticky="nsew", pady=12)
+            v = ctk.CTkLabel(f, text="0", fg_color="transparent",
+                text_color=accent, font=(F,18,"bold")); v.pack()
+            k = ctk.CTkLabel(f, text="", fg_color="transparent",
+                text_color=DIM, font=(F,8)); k.pack()
+            return v, k
+        sv_n, sk_n = stat_tile(0, TEXT)
+        sv_t, sk_t = stat_tile(1, ACCENT)
+        sv_a, sk_a = stat_tile(2, PURPLE)
+        sk_n.configure(text="Sessions"); sk_t.configure(text="Total time"); sk_a.configure(text="Avg / session")
+
+        scroll = ctk.CTkScrollableFrame(win, fg_color=BG2, corner_radius=12)
+        scroll.pack(fill="both", expand=True, padx=22, pady=(0,18))
+
+        def in_period(dt, period):
+            now = time.time()
+            if period == "All":   return True
+            if period == "Today": return time.strftime("%Y%m%d") == time.strftime("%Y%m%d", time.localtime(dt))
+            if period == "Week":  return dt >= now - 7*86400
+            if period == "Month": return dt >= now - 30*86400
+            return True
+
+        def render():
+            for w in scroll.winfo_children(): w.destroy()
+            period = period_var.get()
+            sel = [m for m in meta if in_period(m[1], period)]
+            total = sum(m[3] for m in sel)
+            n_sess = len(sel)
+            avg = (total / n_sess) if n_sess else 0
+            sv_n.configure(text=str(n_sess))
+            sv_t.configure(text=self._fmt_dur(total))
+            sv_a.configure(text=self._fmt_dur(avg))
+            if not sel:
+                ctk.CTkLabel(scroll, text="No sessions in this period.",
+                    fg_color="transparent", text_color=DIM, font=(F,10)).pack(pady=30)
+                return
+            for f, dt, n, dur in sel:
+                when = time.strftime("%b %d, %Y  %H:%M", time.localtime(dt))
+                row = ctk.CTkFrame(scroll, fg_color=BG3, corner_radius=10)
+                row.pack(fill="x", pady=4, padx=8)
+                left = ctk.CTkFrame(row, fg_color="transparent")
+                left.pack(side="left", padx=(14,8), pady=10)
+                ctk.CTkLabel(left, text=when, fg_color="transparent",
+                    text_color=TEXT, font=(F,11,"bold")).pack(anchor="w")
+                ctk.CTkLabel(left, text=f"{n} segments · {self._fmt_dur(dur)}",
+                    fg_color="transparent", text_color=DIM, font=(F,9)).pack(anchor="w")
+                def _del(pf=f):
+                    try: pf.unlink(missing_ok=True)
+                    except Exception: pass
+                    meta[:] = [m for m in meta if m[0] != pf]
+                    render()
+                ctk.CTkButton(row, text="✕", width=30, height=28,
+                    fg_color="transparent", hover_color=RED, text_color=DIM,
+                    font=(F,10,"bold"), corner_radius=6, command=_del
+                    ).pack(side="right", padx=(4,10))
+                ctk.CTkButton(row, text="Open", width=64, height=28,
+                    fg_color=ACCENT, hover_color=ACCENT_HOV, text_color="white",
+                    font=(F,9,"bold"), corner_radius=6,
+                    command=lambda p=f: self._load_session(p, win)
+                    ).pack(side="right", padx=4)
+        render()
 
     def _load_session(self, path, win=None):
         if self.recording:
@@ -3340,8 +3889,11 @@ class App:
                 "Stop the current recording before loading a past session.")
             return
         try:
-            rows = [json.loads(l) for l in
-                    path.read_text(encoding="utf-8").splitlines() if l.strip()]
+            rows = []
+            for l in path.read_text(encoding="utf-8").splitlines():
+                if not l.strip(): continue
+                try: rows.append(json.loads(l))
+                except Exception: pass   # one corrupt line must not kill the load
         except Exception as e:
             messagebox.showerror("Error", f"Could not read session:\n{e}"); return
         if not rows:
@@ -3352,17 +3904,22 @@ class App:
         # Quiet clear (no confirmation dialog — user already confirmed)
         self.committed.clear()
         for w in self.feed.winfo_children(): w.destroy()
-        try:
-            canvas = self.feed._parent_canvas
-            canvas.configure(scrollregion=(0, 0, 0, 0)); canvas.yview_moveto(0)
-        except Exception: pass
-        for d in rows:
-            p = Phrase(id=str(d.get("id", f"hist_{len(self.committed):04d}")),
+        self._reset_feed_view()
+        # Namespace loaded ids by file stem — original "para_0001" ids would
+        # collide with this session's fresh bubble counter and overwrite.
+        stem = path.stem.replace("session_", "")
+        for n, d in enumerate(rows):
+            p = Phrase(id=f"h{stem}_{n:04d}",
                        text=d.get("text",""), translation=d.get("translation",""),
                        lang=d.get("lang","en"), conf=float(d.get("conf",1.0)),
                        ts=float(d.get("ts", time.time())), partial=False,
                        speaker=int(d.get("speaker",-1)))
             self.committed[p.id] = p
+        # A loaded conversation is history — don't let the previous call's
+        # summary/context/facts leak into future translations.
+        self._conversation_summary = ""
+        self._context_window.clear()
+        self._clear_facts()
         self._empty_lbl = None
         for p in list(self.committed.values())[-120:]:   # canvas safety cap
             self._row(p)
@@ -3403,7 +3960,7 @@ class App:
                 ("VTT Captions",   "*.vtt"),
                 ("All files",      "*.*"),
             ],
-            initialfile=f"interpro_{time.strftime('%Y%m%d_%H%M%S')}.txt")
+            initialfile=f"sayvo_{time.strftime('%Y%m%d_%H%M%S')}.txt")
         if not path: return
         ext = Path(path).suffix.lower()
         if   ext == ".srt": self._export_srt(path)
@@ -3422,6 +3979,11 @@ class App:
         if self._facts:
             lines += ["=" * 60, "KEY FACTS", "-" * 60]
             lines += [f"  {icon}  {val}" for val, icon in self._facts.items()]
+            lines.append("")
+        notes = self._notes_snapshot()
+        if notes:
+            lines += ["=" * 60, "NOTES", "-" * 60]
+            lines += notes
             lines.append("")
         with open(path, "w", encoding="utf-8") as f: f.write("\n".join(lines))
 
@@ -3480,12 +4042,8 @@ class App:
         self._conversation_summary = ""
         self._speaker_names.clear()
         for w in self.feed.winfo_children(): w.destroy()
-        # Reset canvas scroll region so new bubbles appear at top, not invisible below
-        try:
-            canvas = self.feed._parent_canvas
-            canvas.configure(scrollregion=(0, 0, 0, 0))
-            canvas.yview_moveto(0)
-        except: pass
+        self._reset_feed_view()
+        self.root.after(250, self._reset_feed_view)   # catch the late shrink
         self._empty_lbl = None
         self._update_empty_state()
         self.sv_segs.configure(text="0")
