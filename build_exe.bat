@@ -1,23 +1,18 @@
 @echo off
 REM ================================================================
-REM  Sayvo - Build a versioned Windows exe from the CLEAN venv
-REM  Usage:  build_exe.bat 24        -> dist\Sayvo_v24.exe
-REM  The build_env venv contains ONLY Sayvo's dependencies, so the
-REM  exe stays small (system Python has torch/paddle/cv2 which used
-REM  to bloat builds to 450MB).
+REM  Sayvo - Build the INSTANT-LAUNCH folder app from the clean venv
+REM  Usage:  build_exe.bat
+REM  Produces dist\Sayvo\Sayvo.exe (+ _internal\).  --onedir means the
+REM  app launches instantly (no 62MB unpack every start like --onefile).
+REM  The version is tracked by __version__ inside the app (shown in the
+REM  header pill / Settings), not in the exe name.
 REM ================================================================
-if "%~1"=="" (
-    echo Usage: build_exe.bat VERSION_NUMBER   e.g.  build_exe.bat 24
-    exit /b 1
-)
-set NAME=Sayvo_v%~1
-
-echo Building %NAME%.exe from clean build_env...
+echo Building instant-launch Sayvo (onedir) from clean build_env...
 build_env\Scripts\pyinstaller ^
   --noconfirm ^
-  --onefile ^
+  --onedir ^
   --windowed ^
-  --name "%NAME%" ^
+  --name "Sayvo" ^
   --icon="sayvo_icon.ico" ^
   --add-data "sayvo_icon.ico;." ^
   --hidden-import customtkinter ^
@@ -27,8 +22,8 @@ build_env\Scripts\pyinstaller ^
   interpro_final.py
 
 echo.
-if exist dist\%NAME%.exe (
-    echo  SUCCESS! Your app is at: dist\%NAME%.exe
+if exist dist\Sayvo\Sayvo.exe (
+    echo  SUCCESS! Instant-launch app: dist\Sayvo\Sayvo.exe
 ) else (
     echo  BUILD FAILED - check the output above for errors.
 )

@@ -9,7 +9,7 @@
 
 #define AppName    "Sayvo"
 #define AppVersion "1.0"
-#define SourceExe  "dist\Sayvo_v38.exe"
+#define SourceExe  "dist\Sayvo_v39.exe"
 
 [Setup]
 AppName={#AppName}
@@ -31,7 +31,8 @@ DisableProgramGroupPage=yes
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"
 
 [Files]
-Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "Sayvo.exe"; Flags: ignoreversion
+; Folder (onedir) build — instant launch, no per-startup unpack.
+Source: "dist\Sayvo\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\Sayvo.exe"

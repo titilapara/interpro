@@ -6,7 +6,7 @@ Dual-track architecture:
   LIVE zone  — raw text + instant Google translation overlay
   Bubble zone — full paragraph + Claude (claude-haiku-4-5) quality translation
 """
-__version__ = "38"
+__version__ = "40"
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import tkinter.font as tkfont
@@ -118,19 +118,55 @@ _DIGIT_WORDS = {
     "cero":"0","uno":"1","una":"1","dos":"2","tres":"3","cuatro":"4",
     "cinco":"5","seis":"6","siete":"7","ocho":"8","nueve":"9",
 }
-_DIGIT_RUN = re.compile(
-    r'\b(?:' + '|'.join(_DIGIT_WORDS) + r')'
-    r'(?:[ ,]+(?:' + '|'.join(_DIGIT_WORDS) + r')){2,}\b',
-    re.IGNORECASE
-)
-
 def _words_to_digits(text: str) -> str:
-    """Convert RUNS of 3+ spoken single digits ("nueve cinco cuatro…")
-    to digits. Anything shorter or compound is left untouched."""
-    def conv(m):
-        words = re.split(r'[ ,]+', m.group(0))
-        return ' '.join(_DIGIT_WORDS.get(w.lower(), w) for w in words if w)
-    return _DIGIT_RUN.sub(conv, text)
+    """Normalise DIGIT-DICTATION runs (phone / account / confirmation numbers)
+    into individual space-separated digits — even when Deepgram hands back a
+    MIX of spoken words, single digits and 2-digit chunks
+    ("seis uno 15 7 4 4 9 0 0" -> "6 1 1 5 7 4 4 9 0 0"). Only fires when a
+    contiguous run of 3+ number tokens is MOSTLY single digits, so ordinary
+    counts like "20 30 40" are left alone. This is what stops the LLM from
+    dropping/duplicating digits in a spoken number."""
+    toks = text.split(' ')
+    out, i = [], 0
+
+    def digtok(tok):
+        # -> (digit_string, is_single, ender_punct) or (None, False, "")
+        stripped = tok.rstrip('.,;:!?…')
+        tail = tok[len(stripped):]
+        ender = ''.join(c for c in tail if c in '.!?…')   # commas don't end a run
+        core = _deaccent(stripped.strip('¿¡()"').lower())
+        if core in _DIGIT_WORDS:
+            return _DIGIT_WORDS[core], True, ender
+        if core.isdigit() and 1 <= len(core) <= 2:
+            return core, (len(core) == 1), ender
+        return None, False, ""
+
+    while i < len(toks):
+        d0, _s, _e = digtok(toks[i])
+        if d0 is None:
+            out.append(toks[i]); i += 1; continue
+        run, j = [], i
+        while j < len(toks):
+            dj, sj, ej = digtok(toks[j])
+            if dj is None:
+                break
+            run.append((dj, sj, ej)); j += 1
+            if ej:                       # a sentence-ender closes the run
+                break
+        singles = sum(1 for d, s, e in run if s)
+        if len(run) >= 3 and singles >= 2 and singles / len(run) >= 0.6:
+            digits = ''.join(d for d, s, e in run)
+            out.append(' '.join(digits) + (run[-1][2] or "")); i = j
+        else:
+            out.extend(toks[i:j]); i = j
+    return ' '.join(out)
+
+def _join_digit_runs(text: str) -> str:
+    """After phone formatting, join any remaining run of 4+ single spaced
+    digits into one solid number (account / confirmation / ID). Phone-length
+    runs (7/10/11) are already turned into formatted phones before this."""
+    return re.sub(r'(?<!\d)\d(?: \d){3,}(?!\d)',
+                  lambda m: m.group(0).replace(' ', ''), text)
 
 # ── Compound spoken numbers (ES + EN grammar parser) ─────────────
 # "doscientos cincuenta y tres" → 253, "dos mil veinticuatro" → 2024,
@@ -174,6 +210,38 @@ def _deaccent(w: str) -> str:
     return ''.join(c for c in unicodedata.normalize("NFD", w)
                    if unicodedata.category(c) != "Mn")
 
+def _lowest_place(n):
+    lp, t = 1, int(n)
+    while t and t % 10 == 0:
+        lp *= 10; t //= 10
+    return lp
+
+def _concat_place_value(text):
+    # Merge adjacent DIGIT groups that form a place-value number:
+    # "200 5" -> 205, "1000 800" -> 1800, "1000 100 1" -> 1101, "20 5" -> 25.
+    # A run can only START on a round number (trailing zero, >=10), so single
+    # dictated digits ("9 5 4 …" for phones) never merge — they stay separate.
+    toks = text.split(' ')
+    out, i = [], 0
+    while i < len(toks):
+        core = toks[i].rstrip('.,;:!?…')
+        tail = toks[i][len(core):]
+        if (core.isdigit() and len(core) >= 2 and int(core) % 10 == 0
+                and _lowest_place(core) > 1 and not tail):
+            V = int(core); end = i; etail = ""
+            j = i + 1
+            while j < len(toks):
+                c2 = toks[j].rstrip('.,;:!?…'); t2 = toks[j][len(c2):]
+                if c2.isdigit() and 0 < int(c2) < _lowest_place(V):
+                    V += int(c2); end = j; etail = t2
+                    if t2: break              # stop after trailing punctuation
+                    j += 1; continue
+                break
+            out.append(str(V) + etail); i = end + 1
+        else:
+            out.append(toks[i]); i += 1
+    return ' '.join(out)
+
 def _compound_numbers_to_digits(text: str) -> str:
     # Toll-free prefix first — "one eight hundred" is 1-800, not 801/900
     text = re.sub(r'(?i)\b(?:one|uno|un)[,\s\-]+(?:eight\s+hundred|ochocientos)\b',
@@ -185,17 +253,28 @@ def _compound_numbers_to_digits(text: str) -> str:
 
     tokens = text.split(' ')
     out, i = [], 0
-    def classify(tok):
+
+    def ntok(tok):
+        # -> (value, kind, is_word). kind: u/t/d/h/m are building blocks,
+        # 'x' = a complete standalone digit group (25, 205, 1800…) that is
+        # NOT a simple block. Understands both spoken WORDS and DIGITS so a
+        # half-numeralized "doscientos 5" or "18 hundred" still combines.
         core = _deaccent(tok.strip('.,;:!?¿¡()"…').lower())
         for table, kind in ((_NW_UNIT,'u'), (_NW_TEEN,'t'), (_NW_TENS,'d'),
                             (_NW_HUND_ES,'h'), (_NW_MULT,'m')):
             if core in table:
-                return table[core], kind, core
-        return None, None, core
+                return table[core], kind, True
+        if core.isdigit():
+            n = int(core)
+            if   1 <= n <= 9:   return n, 'u', False
+            elif 10 <= n <= 19: return n, 't', False
+            elif n in (20,30,40,50,60,70,80,90): return n, 'd', False
+            elif n in (100,200,300,400,500,600,700,800,900): return n, 'h', False
+            elif n in (1000, 1000000): return n, 'm', False
+            return n, 'x', False
+        return None, None, None
 
     def _ok_next(prev, cur):
-        """Number-grammar transitions. Bare unit chains ('nine five four')
-        are dictation, not compounds — reject so the digit-run pass gets them."""
         if prev is None: return True
         pv, pk = prev; cv, ck = cur
         if pk in ('u', 't'): return ck == 'm'
@@ -207,56 +286,73 @@ def _compound_numbers_to_digits(text: str) -> str:
         return True
 
     while i < len(tokens):
-        v, kind, core = classify(tokens[i])
-        if v is None:
+        v0, k0, w0 = ntok(tokens[i])
+        if k0 is None:
             out.append(tokens[i]); i += 1; continue
-        # collect the full number-word sequence
-        seq = []          # (value, kind, core)
-        raw_end = i
-        j = i
+
+        # Decide whether to START a compound here.
+        start = False
+        if w0 and k0 in ('u','t','d','h','m'):
+            start = True                      # any spoken number-word may start
+        elif (not w0) and k0 in ('u','t','d'):
+            # a bare digit starts ONLY if a scale WORD follows ("18 hundred");
+            # never a plain digit run (keeps phone dictation intact).
+            if i + 1 < len(tokens):
+                _, k1, w1 = ntok(tokens[i+1])
+                if w1 and k1 in ('h','m'):
+                    start = True
+        if not start:
+            out.append(tokens[i]); i += 1; continue
+
+        seq = []; raw_end = i; j = i
         while j < len(tokens):
-            v2, k2, c2 = classify(tokens[j])
-            if v2 is not None:
+            vj, kj, wj = ntok(tokens[j])
+            if kj in ('u','t','d','h','m'):
                 prev = (seq[-1][0], seq[-1][1]) if seq else None
-                if not _ok_next(prev, (v2, k2)):
-                    break                     # dictation / new number starts
-                seq.append((v2, k2, c2)); raw_end = j
-                # sequence stops after a token carrying trailing punctuation
+                if not _ok_next(prev, (vj, kj)):
+                    break
+                seq.append((vj, kj, wj)); raw_end = j
                 if tokens[j].rstrip() != tokens[j].rstrip('.,;:!?…'):
                     j += 1; break
                 j += 1; continue
-            # connectors: ES "y" between tens+unit, EN "and" after >=100
-            if c2 in ("y", "and") and seq and j + 1 < len(tokens):
-                v3, k3, _ = classify(tokens[j+1])
+            if kj == 'x':
+                break                         # a complete digit group won't merge here
+            cj = _deaccent(tokens[j].strip('.,;:!?¿¡()"').lower())
+            if cj in ("y", "and") and seq and j + 1 < len(tokens):
+                _, k3, _w = ntok(tokens[j+1])
                 prev_k = seq[-1][1]
-                if v3 is not None and (
-                        (c2 == "y" and prev_k == 'd' and k3 == 'u') or
-                        (c2 == "and" and k3 in ('u','t','d'))):
+                if k3 in ('u','t','d') and (
+                        (cj == "y" and prev_k == 'd') or (cj == "and")):
                     j += 1; continue
             break
-        # guardrails: lone risky words stay words ("una vez", "mil gracias")
-        if len(seq) == 1 and seq[0][2] in _NW_RISKY_ALONE:
+
+        core0 = _deaccent(tokens[i].strip('.,;:!?¿¡()"…').lower())
+        # lone risky WORD ("mil gracias", "una vez") stays a word
+        if len(seq) == 1 and w0 and core0 in _NW_RISKY_ALONE:
             out.append(tokens[i]); i += 1; continue
-        # compute value
+        # a single digit that didn't actually combine → leave as spoken
+        if len(seq) == 1 and not w0:
+            out.append(tokens[i]); i += 1; continue
+
         total = current = 0
-        valid = True
-        for v2, k2, _ in seq:
-            if k2 in ('u','t','d','h'):
-                current += v2
-            elif k2 == 'm':
-                if v2 == 100:
+        for vj, kj, _ in seq:
+            if kj in ('u','t','d','h'):
+                current += vj
+            elif kj == 'm':
+                if vj == 100:
                     current = (current if current else 1) * 100
                 else:
-                    total += (current if current else 1) * v2
+                    total += (current if current else 1) * vj
                     current = 0
         value = total + current
-        if not valid or value <= 0:
+        if value <= 0:
             out.append(tokens[i]); i += 1; continue
-        # preserve trailing punctuation of the last consumed token
         tail = tokens[raw_end][len(tokens[raw_end].rstrip('.,;:!?…')):]
         out.append(str(value) + tail)
         i = raw_end + 1
-    return ' '.join(out)
+
+    # Second pass: stitch place-value digit groups Deepgram already split.
+    return _concat_place_value(' '.join(out))
 
 def _split_sentences(text: str) -> list:
     """Split a Deepgram final into individual sentences so each can be
@@ -991,6 +1087,7 @@ class DeepgramStream:
             text = _words_to_digits(text)
             text = _format_currency(text)
             text = _format_phone(text)
+            text = _join_digit_runs(text)
 
             spk_ids_in_final = [w.get("speaker") for w in words
                                  if w.get("speaker") is not None]
@@ -1022,8 +1119,8 @@ class DeepgramStream:
                     run_text = " ".join(
                         w.get("punctuated_word") or w.get("word","") for w in run_words
                     ).strip()
-                    run_text = _format_phone(_format_currency(
-                        _words_to_digits(_compound_numbers_to_digits(run_text))))
+                    run_text = _join_digit_runs(_format_phone(_format_currency(
+                        _words_to_digits(_compound_numbers_to_digits(run_text)))))
                 if not run_text:
                     continue
 
@@ -1845,7 +1942,8 @@ class App:
             border_color=BORDER, font=(F,10),
             corner_radius=10, height=34)
         self.search_entry.pack(side="left", fill="x", expand=True)
-        self.search_entry.bind("<KeyRelease>", lambda e: self._rebuild())
+        self._search_job = None
+        self.search_entry.bind("<KeyRelease>", self._on_search_key)
         def _clear_search():
             self.search_entry.delete(0, "end")
             self._rebuild()
@@ -2465,11 +2563,14 @@ class App:
                             self._audio_warn = False
                             self.hdr_status.configure(text="Recording", text_color=GREEN)
                     self._set_meter(lvl, spk)
-                    self.bytes_lbl.configure(text=f"{bcap/1024:.1f} KB captured")
-                    self.d_cap.configure(text=f"{bcap/1024:.1f} KB")
-                    if self._dg:
-                        self.d_sent.configure(text=f"{self._dg._bytes_sent/1024:.1f} KB")
-                        self.d_msgs.configure(text=str(self._dg._msgs_recv))
+                    now = time.time()
+                    if now - getattr(self, "_lbl_t", 0) > 0.4:   # throttle label churn
+                        self._lbl_t = now
+                        self.bytes_lbl.configure(text=f"{bcap/1024:.1f} KB captured")
+                        self.d_cap.configure(text=f"{bcap/1024:.1f} KB")
+                        if self._dg:
+                            self.d_sent.configure(text=f"{self._dg._bytes_sent/1024:.1f} KB")
+                            self.d_msgs.configure(text=str(self._dg._msgs_recv))
                 elif k == "connect_result":
                     _, ok = item
                     if ok: self._finish_start()
@@ -2543,11 +2644,13 @@ class App:
         if self.show_debug.get() and self._cap:
             self._draw_wave()
 
-        self.root.after(33, self._poll)
+        # Adaptive: quick while recording, relaxed when idle → low CPU on
+        # weak machines without any visible lag during a call.
+        self.root.after(45 if self.recording else 120, self._poll)
 
     def _set_meter(self, lvl, spk):
         now = time.time()
-        if now - self._last_meter < 0.033: return
+        if now - self._last_meter < 0.05: return
         self._last_meter = now
         pct = min(1.0, lvl * 4.0)
         color = GREEN if pct < 0.55 else YELLOW if pct < 0.82 else RED
@@ -2810,8 +2913,10 @@ class App:
         # Re-apply formatters on the full buffer — numbers often arrive split
         # across separate finals ("doscientos cincuenta" | "y tres")
         text = _compound_numbers_to_digits(text)
+        text = _words_to_digits(text)
         text = _format_currency(text)
         text = _format_phone(text)
+        text = _join_digit_runs(text)
 
         # Clear the LIVE workspace instantly
         self.live_confirmed.configure(text="")
@@ -2835,8 +2940,8 @@ class App:
         # Keep only the newest ~120 bubbles ON SCREEN — the full transcript
         # stays in committed / session file / exports / summary.
         kids = self.feed.winfo_children()
-        if len(kids) > 120:
-            for w in kids[:len(kids) - 120]:
+        if len(kids) > 80:
+            for w in kids[:len(kids) - 80]:
                 try: w.destroy()
                 except Exception: pass
         if self.autoscroll.get():
@@ -2984,7 +3089,15 @@ class App:
                                                   summary=summary, glossary=glossary)
         else:
             g = self.translator.google_translate(text, src, tgt)
-            tr, engine = g, ("google" if g else "none")
+            if not g and self.translator._claude:
+                # Google (unofficial scraper) failed — rescue with Claude so
+                # the bubble never shows a bare "—".
+                g, _eng = self.translator.claude_translate(text, src, tgt, conf,
+                                                           domain=domain)
+                self.log.log("Google failed -> Claude rescue", "WARN")
+                tr, engine = g, ("claude" if g else "none")
+            else:
+                tr, engine = g, ("google" if g else "none")
         if engine == "claude":
             try: self._usage_month()["claude"] += 1
             except Exception: pass
@@ -3173,6 +3286,13 @@ class App:
         bubble, _, _ = self._bubble_card(p, live=False)
         return bubble
 
+    def _on_search_key(self, event=None):
+        # Rebuild 250ms after the last keystroke, not on every one.
+        if getattr(self, "_search_job", None):
+            try: self.root.after_cancel(self._search_job)
+            except Exception: pass
+        self._search_job = self.root.after(250, self._rebuild)
+
     def _on_window_resize(self, event=None):
         if self._resize_job:
             try: self.root.after_cancel(self._resize_job)
@@ -3280,7 +3400,7 @@ class App:
                        if not q or q in p.text.lower()
                        or q in (p.translation or "").lower()]
             self._empty_lbl = None   # destroyed with the other children above
-            for p in matches[-120:]:   # canvas safety cap — newest 120
+            for p in matches[-80:]:    # keep the newest 80 on screen (perf)
                 self._row(p)
             self._update_empty_state()
             # ORIGINAL | TRANSLATION header only when actually two-column
@@ -3921,7 +4041,7 @@ class App:
         self._context_window.clear()
         self._clear_facts()
         self._empty_lbl = None
-        for p in list(self.committed.values())[-120:]:   # canvas safety cap
+        for p in list(self.committed.values())[-80:]:    # keep newest 80 (perf)
             self._row(p)
         self._update_empty_state()
         self.seg_count  = len(rows)
