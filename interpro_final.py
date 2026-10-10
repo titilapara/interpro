@@ -2,11 +2,10 @@
 """
 Sayvo — Professional Real-Time Interpreter Tool
 ===================================================
-Dual-track architecture:
-  LIVE zone  — raw text + instant Google translation overlay
-  Bubble zone — full paragraph + Claude (claude-haiku-4-5) quality translation
+  LIVE zone   — what's being said right now (Deepgram transcript)
+  Bubble zone — each finished paragraph + its Claude (claude-haiku-4-5) translation
 """
-__version__ = "40"
+__version__ = "43"
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import tkinter.font as tkfont
@@ -534,6 +533,20 @@ CORE RULES — FOLLOW THESE WITHOUT EXCEPTION
    Never add explanations, labels, notes, alternatives in parentheses, or any \
 commentary. Your entire response must be the translated sentence(s) and nothing else.
 
+1a. YOU ARE A SILENT ENGINE — NEVER REFUSE, NEVER TALK TO THE USER. (NON-NEGOTIABLE)
+   You are a machine translation component, not a chat assistant. The user NEVER \
+reads a message written by you — they only ever read a translation. Therefore:
+   - NEVER refuse to translate. NEVER say "I'm unable to", "I can't provide", \
+"this appears to be", "please clarify", "please provide", or anything similar.
+   - NEVER comment on, question, or apologize for the quality of the input.
+   - NEVER ask for a corrected or clarified source. There is no one to ask.
+   If the input is garbled, corrupted, nonsensical, or only partially intelligible \
+(transcription errors are common and expected), do your BEST-EFFORT translation of \
+whatever meaning you can recover, translating recognizable words literally. \
+ONLY if the input is so completely unintelligible that not one word can be rendered, \
+output a single em-dash: — (nothing else). A refusal paragraph is ALWAYS the wrong \
+answer — a rough or partial translation, or a bare "—", is always correct.
+
 2. CLEAN UP SPEECH ARTIFACTS NATURALLY.
    Spoken transcripts routinely contain disfluencies. Remove or repair:
    - Filler words: "um", "uh", "er", "like", "you know", "I mean"
@@ -775,19 +788,13 @@ after you. Every response must be clean, natural, and ready to read aloud. \
 Output ONLY the translated text."""
 
 class Translator:
-    """
-    Two engines, two speeds:
-      google_translate()  — instant (~100 ms), used for the LIVE overlay
-      claude_translate()  — polished (~1-2 s), used for the final BUBBLE
-    Thread-safe: _google_lock serialises cache mutations.
-    """
+    """Claude (claude-haiku-4-5) translation for each finished bubble.
+    Google Translate was removed in v43: the free endpoint is unofficial
+    (against Google's terms for a paid product) and it got the user's
+    connection blocked as "unusual traffic"."""
     def __init__(self):
-        self._google_cache = {}
-        self._google_lock  = threading.Lock()
         self._claude       = None
         self.log           = None   # set by App so API errors reach the debug panel
-        try: from deep_translator import GoogleTranslator; self._google_ok = True
-        except: self._google_ok = False
 
     def set_anthropic_key(self, key):
         self._claude = None
@@ -802,21 +809,19 @@ class Translator:
     def claude_translate(self, text: str, src: str, tgt: str, conf: float = 1.0,
                          context: list = None, domain: str = "Auto",
                          summary: str = "", glossary: dict = None):
-        """High-quality Claude translation with prompt caching.
-        Falls back to Google if no API key or on error.
-        Returns (translation, engine) where engine is 'claude'/'google'/'none'."""
-        if not text.strip() or src == tgt: return "", "none"
-        if self._claude:
+        """Claude translation with prompt caching.
+        Returns (translation, engine) where engine is 'claude' or 'none'.
+        One retry: after a network blip, or a reply that was a note instead
+        of a translation, try again without the conversation context (stray
+        context, like a wrong "Hindi" label, is what usually confuses it)."""
+        if not text.strip() or src == tgt or not self._claude: return "", "none"
+        result = self._claude_translate(text, src, tgt, conf,
+                                        context, domain, summary, glossary)
+        if not result:
+            time.sleep(0.4)
             result = self._claude_translate(text, src, tgt, conf,
-                                            context, domain, summary, glossary)
-            if result: return result, "claude"
-        g = self.google_translate(text, src, tgt)
-        return g, ("google" if g else "none")
-
-    def google_translate(self, text: str, src: str, tgt: str) -> str:
-        """Fast Google translation — for real-time live overlay."""
-        if not text.strip() or src == tgt: return ""
-        return self._google_translate(text, src, tgt)
+                                            None, domain, "", glossary)
+        return (result, "claude") if result else ("", "none")
 
     # Domain-specific translation hints (appended to user message, not system prompt,
     # so the system prompt stays cacheable / stable).
@@ -840,6 +845,21 @@ class Translator:
         "Casual":
             "Domain: Casual — relaxed, natural conversational tone. Contractions are fine.",
     }
+
+    _CHAT_RE = re.compile(
+        r"\b(translat\w*|traduc\w*|source (text|language)|the input|input text|"
+        r"resubmit|re-submit|transcri\w*|clarif\w*|(provided|this) text)\b", re.I)
+
+    @classmethod
+    def _looks_like_chat(cls, src_text, out):
+        """True when Claude wrote a note TO the user ("I appreciate you testing
+        my system… please resubmit…") instead of a translation. A real
+        translation is about as long as its source (EN/ES differ by ~1.3x at
+        most); these notes are far longer AND talk about the translating task
+        itself. Both must be true, so a caller genuinely saying "I can't
+        provide that" is safe."""
+        too_long = len(out) > 2 * len(src_text) + 60
+        return too_long and bool(cls._CHAT_RE.search(out))
 
     def _claude_translate(self, text, src, tgt, conf,
                           context=None, domain="Auto", summary="", glossary=None):
@@ -890,24 +910,14 @@ class Translator:
                          "cache_control":{"type":"ephemeral"}}],
                 messages=[{"role":"user","content": user_msg}]
             )
-            return resp.content[0].text.strip()
+            out = resp.content[0].text.strip()
+            if self._looks_like_chat(text, out):
+                if self.log:
+                    self.log.log("Claude replied with a note instead of a translation, discarded", "WARN")
+                return ""          # claude_translate() retries once, plainer
+            return out
         except Exception as e:
             if self.log: self.log.log(f"Claude API error: {e}", "ERROR")
-            return ""
-
-    def _google_translate(self, text, src, tgt):
-        if not self._google_ok: return ""
-        k = f"{src}>{tgt}"
-        with self._google_lock:
-            if k not in self._google_cache:
-                from deep_translator import GoogleTranslator
-                self._google_cache[k] = GoogleTranslator(source=src, target=tgt)
-            inst = self._google_cache[k]
-        try:
-            return inst.translate(text) or ""
-        except:
-            with self._google_lock:
-                self._google_cache.pop(k, None)
             return ""
 
 # ── Deepgram Stream ──────────────────────────────────────────────
@@ -988,18 +998,130 @@ class TranslationMemory:
         except Exception:
             pass
 
+class SpeechGate:
+    """Smart pause. Deepgram bills every second of audio it receives, so long
+    stretches with NO human voice (silence, hold music, background noise) are
+    held back instead of streamed. Uses the Silero VAD neural model, which is
+    trained to tell voices apart from music and noise.
+
+    Built so it can never cost a word (the crude v17 loudness gate did):
+      * pauses only after IDLE_S of continuous non-speech, so ordinary pauses
+        in a conversation never trigger it, and by then Deepgram has long
+        since finalised the last sentence;
+      * while paused it keeps the last PREROLL_S of audio and, the moment a
+        voice appears, sends that first, so opening syllables still arrive;
+      * the audio itself is never altered: it is sent untouched or held;
+      * if Deepgram is still producing words it stays open regardless;
+      * any problem (model missing, onnxruntime error) means it simply sends
+        everything, exactly like before (fail-open)."""
+    FRAME, CTX, SR = 512, 64, 16000
+    THRESH    = 0.30    # deliberately low: when unsure, treat it as speech
+    IDLE_S    = 8.0
+    PREROLL_S = 1.5
+    _session = None
+    _load_err = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def preload(cls):
+        """Load the model once, in the background (onnxruntime import is slow
+        on weak PCs, so it must never delay pressing Start)."""
+        with cls._lock:
+            if cls._session is not None or cls._load_err:
+                return
+            try:
+                import onnxruntime as ort
+                base = getattr(sys, "_MEIPASS", None) or str(Path(__file__).parent)
+                o = ort.SessionOptions()
+                o.inter_op_num_threads = 1; o.intra_op_num_threads = 1
+                o.enable_cpu_mem_arena = False; o.log_severity_level = 4
+                cls._session = ort.InferenceSession(
+                    str(Path(base) / "silero_vad_v6.onnx"),
+                    providers=["CPUExecutionProvider"], sess_options=o)
+            except Exception as e:
+                cls._load_err = str(e) or type(e).__name__
+
+    def __init__(self):
+        self._h = np.zeros((1, 1, 128), np.float32)
+        self._c = np.zeros((1, 1, 128), np.float32)
+        self._ctx = np.zeros(self.CTX, np.float32)
+        self._pend = np.zeros(0, np.float32)
+        self._pre = deque(); self._pre_n = 0
+        self.failed = False
+        self.reset()
+        self.paused_s = 0.0
+
+    def reset(self):
+        """Back to streaming (used on start and when the user re-enables it)."""
+        self.open = True
+        self.last_speech = time.time()
+        self._paused_at = None
+        self._pre.clear(); self._pre_n = 0
+
+    def touch(self):
+        """Deepgram produced words: that is speech, whatever the model says."""
+        self.last_speech = time.time()
+
+    def saved_seconds(self):
+        extra = (time.time() - self._paused_at) if self._paused_at else 0.0
+        return self.paused_s + extra
+
+    def _speech_in(self, chunk):
+        s = SpeechGate._session
+        if s is None or self.failed:
+            return True                      # fail-open: never hold audio
+        buf = np.concatenate([self._pend, chunk.astype(np.float32, copy=False)])
+        n = len(buf) // self.FRAME
+        if n == 0:
+            self._pend = buf
+            return False
+        frames = buf[:n * self.FRAME].reshape(n, self.FRAME)
+        self._pend = buf[n * self.FRAME:]
+        ctx = np.vstack([self._ctx[None, :], frames[:-1, -self.CTX:]])
+        self._ctx = frames[-1, -self.CTX:].copy()
+        x = np.ascontiguousarray(np.concatenate([ctx, frames], axis=1), np.float32)
+        try:
+            p, self._h, self._c = s.run(None, {"input": x, "h": self._h, "c": self._c})
+        except Exception:
+            self.failed = True
+            return True
+        return float(np.max(p)) >= self.THRESH
+
+    def feed(self, chunk, pcm):
+        """chunk: float32 16 kHz mono; pcm: the same audio as int16 bytes.
+        Returns the pcm blobs to send right now (possibly none)."""
+        now = time.time()
+        if self._speech_in(chunk):
+            self.last_speech = now
+        if self.open:
+            if now - self.last_speech <= self.IDLE_S:
+                return [pcm]
+            self.open = False; self._paused_at = now      # start holding
+        elif self.last_speech >= self._paused_at:          # a voice is back
+            out = list(self._pre); out.append(pcm)
+            self._pre.clear(); self._pre_n = 0
+            self.paused_s += now - self._paused_at; self._paused_at = None
+            self.open = True
+            return out
+        self._pre.append(pcm); self._pre_n += len(pcm)
+        cap = int(self.PREROLL_S * self.SR) * 2
+        while self._pre_n > cap and len(self._pre) > 1:
+            self._pre_n -= len(self._pre.popleft())
+        return []
+
+
 class DeepgramStream:
     """
     Sends raw audio to Deepgram, receives transcripts.
-    Translation is NOT done here — the App handles it on two tracks:
-      • Google (live overlay)  — called from App._async_live_tr
-      • Claude (bubble polish) — called from App._translate_and_push_bubble
+    Translation is NOT done here — the App translates each finished bubble
+    in App._translate_and_push_bubble.
     """
     def __init__(self, api_key, ui_q, log):
         self.api_key = api_key; self.ui_q = ui_q; self.log = log
         self._ws = None; self._connected = False; self._running = False
         self._audio_q = queue.Queue(maxsize=500)
         self._src_name = "Auto Detect"
+        self._allowed = None          # in-pair translation codes, e.g. {"en","es"}
         self._phrase_n = 0; self._cur_id = None
         self._bytes_sent = 0; self._msgs_recv = 0
         self._first_audio_t = None; self._first_resp_t = None
@@ -1009,8 +1131,9 @@ class DeepgramStream:
         self._url = None            # saved for auto-reconnect
         self._reconnecting = False
 
-    def connect(self, src_lang_name="Auto Detect", keyterms=None):
+    def connect(self, src_lang_name="Auto Detect", keyterms=None, allowed=None):
         self._src_name = src_lang_name
+        self._allowed = allowed
         self._running = True
         self._open_evt.clear(); self._connected = False
         url = build_dg_url(src_lang_name, keyterms=keyterms)
@@ -1264,7 +1387,7 @@ class DeepgramStream:
                         self.log.log(f"First audio sent {len(pcm)}B","WS")
                 except Exception as e:
                     self.log.log(f"Send error:{e}","ERROR"); self._connected = False; break
-            if self._connected and time.time() - last_ka > 8.0:
+            if self._connected and time.time() - last_ka > 5.0:
                 try: self._ws.send(json.dumps({"type":"KeepAlive"})); last_ka = time.time()
                 except: pass
             time.sleep(0.01)
@@ -1272,24 +1395,39 @@ class DeepgramStream:
     def _lang(self, alt, data):
         if self._src_name != "Auto Detect":
             return LANGUAGES[self._src_name][1]
+        def accept(code):
+            """Map a Deepgram code to a translation code, but trust it ONLY
+            when it belongs to the active language pair. Deepgram's detector
+            rarely (but really) mislabels a clear English line as Hindi/etc.;
+            outside the pair there is nowhere to translate it, so we drop the
+            stray guess and keep the last good language instead."""
+            tr = DG_TO_TRANS.get(code)
+            if not tr:
+                return None
+            if self._allowed and tr not in self._allowed:
+                return None
+            return tr
+
         d = (data.get("channel",{}).get("detected_language","") or
              data.get("metadata",{}).get("detected_language",""))
         if d and d not in ("","auto","multi"):
-            code = d.lower().split("-")[0]
-            if code in DG_TO_TRANS:
-                self._last_lang = DG_TO_TRANS[code]
+            tr = accept(d.lower().split("-")[0])
+            if tr:
+                self._last_lang = tr
                 return self._last_lang
         words = alt.get("words",[])
         if words:
             langs = [w.get("language","").lower().split("-")[0]
                      for w in words if w.get("language","")]
-            if langs:
-                dominant = Counter(langs).most_common(1)[0][0]
-                if dominant in DG_TO_TRANS:
-                    self._last_lang = DG_TO_TRANS[dominant]
+            # walk candidates by frequency; take the first that's in-pair, so a
+            # few stray "hi" word-tags can't outvote the real English/Spanish.
+            for cand, _n in Counter(langs).most_common():
+                tr = accept(cand)
+                if tr:
+                    self._last_lang = tr
                     return self._last_lang
-        # Detection missing → assume the speaker hasn't switched language
-        # (the old hard "en" default mislabeled Spanish as English)
+        # Detection missing or entirely out-of-pair → keep the last good
+        # language (don't hard-default to "en": that mislabeled Spanish).
         return getattr(self, "_last_lang", "en")
 
     def send_pcm(self, pcm):
@@ -1449,10 +1587,8 @@ class App:
         self._para_lock    = threading.Lock()
         self._pending_dev  = None
 
-        # Live-translation debounce state
-        self._live_tr_busy = False
-        self._live_tr_ver  = 0      # incremented each time a new live-tr is started
         self._current_partial = ""  # latest in-flight partial text (for manual flush)
+        self._gate = None           # SpeechGate while recording (smart pause)
 
         # Silence watchdog (warns when the audio source goes dead mid-call)
         self._last_audio_t = 0.0
@@ -1508,7 +1644,6 @@ class App:
         self.lang_b_var   = tk.StringVar(value=self._settings.get("lang_b", "Spanish"))
         self.dev_var      = tk.StringVar()
         self.domain_var   = tk.StringVar(value=self._settings.get("domain", "Auto"))
-        self.quality_var  = tk.StringVar(value=self._settings.get("quality", "Balanced — smart mix"))
         self.show_tr      = tk.BooleanVar(value=self._settings.get("show_tr", True))
         self.autoscroll   = tk.BooleanVar(value=self._settings.get("autoscroll", True))
         self.show_debug   = tk.BooleanVar(value=False)
@@ -1518,6 +1653,9 @@ class App:
         # auto-flipping on resize caused a resize->rebuild->resize freeze.
         self._twocol     = bool(self._settings.get("twocol", True))
         self.twocol_var  = tk.BooleanVar(value=self._twocol)
+        self._smart_pause    = bool(self._settings.get("smart_pause", True))
+        self.smart_pause_var = tk.BooleanVar(value=self._smart_pause)
+        threading.Thread(target=SpeechGate.preload, daemon=True).start()
         self._narrow     = False   # render stacked when genuinely too narrow
         self._rebuilding = False   # hard reentrancy guard against rebuild loops
 
@@ -1623,7 +1761,6 @@ class App:
                         if 0 <= i < len(self.devices) else "")
             self._settings.update({
                 "device_name": dev_name,
-                "quality":     self.quality_var.get(),
                 "lang_a":      self.lang_a_var.get(),
                 "lang_b":      self.lang_b_var.get(),
                 "textsize":    self.textsize_var.get(),
@@ -1778,6 +1915,13 @@ class App:
             corner_radius=4, border_color=BORDER, checkmark_color="white",
             checkbox_width=16, checkbox_height=16
         ).pack(anchor="w", pady=2)
+        ctk.CTkCheckBox(opts, text="Pause billing on silence / hold music",
+            variable=self.smart_pause_var,
+            fg_color=ACCENT, hover_color=BG4, text_color=DIM, font=(F,9),
+            command=self._toggle_smart_pause,
+            corner_radius=4, border_color=BORDER, checkmark_color="white",
+            checkbox_width=16, checkbox_height=16
+        ).pack(anchor="w", pady=2)
         ctk.CTkButton(bot, text="📄  Call Summary", fg_color=BG3,
             hover_color=BG4, text_color=GREEN, font=(F,10), height=38,
             corner_radius=10, anchor="w",
@@ -1862,22 +2006,6 @@ class App:
         self.domain_menu.pack(fill="x")
         ctk.CTkLabel(dmd, text="Shapes Claude's translation vocabulary & tone",
             fg_color="transparent", text_color=DIM, font=(F,8)).pack(anchor="w", pady=(5,0))
-        self._div(sc)
-
-        # ── Translation mode (cost control) ───────────────────────
-        self._sec(sc, "TRANSLATION MODE")
-        qmd = ctk.CTkFrame(sc, fg_color="transparent"); qmd.pack(fill="x", **px)
-        self.quality_menu = ctk.CTkOptionMenu(
-            qmd, variable=self.quality_var, command=self._save_settings,
-            values=["Economy — Google only",
-                    "Balanced — smart mix",
-                    "Premium — all Claude"],
-            fg_color=BG3, button_color=BG4, button_hover_color=BG3,
-            text_color=TEXT, font=(F,9), corner_radius=8, dynamic_resizing=False)
-        self.quality_menu.pack(fill="x")
-        ctk.CTkLabel(qmd, text="Balanced: Claude only for numbers, low-confidence\naudio & complex sentences — cuts cost ~75%",
-            fg_color="transparent", text_color=DIM, font=(F,8),
-            justify="left").pack(anchor="w", pady=(5,0))
         self._div(sc)
 
         # ── Text size ─────────────────────────────────────────────
@@ -2018,13 +2146,7 @@ class App:
         self.live_partial = ctk.CTkLabel(live, text="Waiting for speech…",
             fg_color="transparent", text_color=DIM, font=(F,12),
             anchor="w", justify="left", wraplength=900)
-        self.live_partial.pack(fill="x", padx=24, pady=(0,2))
-
-        # Real-time Google translation (large, bold)
-        self.live_tr = ctk.CTkLabel(live, text="", fg_color="transparent",
-            text_color=TEXT, font=(F,21,"bold"), anchor="w", justify="left",
-            wraplength=900)
-        self.live_tr.pack(fill="x", padx=24, pady=(4,18))
+        self.live_partial.pack(fill="x", padx=24, pady=(0,18))
 
         # ── Footer content ─────────────────────────────────────────
         ctk.CTkLabel(cs, text="Confidence", fg_color="transparent",
@@ -2407,6 +2529,10 @@ class App:
         if not api_key:
             messagebox.showerror("No API Key",
                 "Enter your Deepgram API key first.\nconsole.deepgram.com"); return
+        if not self.translator._claude:
+            messagebox.showwarning("No Claude key",
+                "Translations need your Claude (Anthropic) API key.\n"
+                "Add it in ⚙ Settings. Until then Sayvo will only transcribe.")
         idx = self.dev_combo.current()
         if idx < 0 or idx >= len(self.devices):
             messagebox.showerror("No Device","Select an audio input device."); return
@@ -2421,10 +2547,12 @@ class App:
         self._dg = DeepgramStream(api_key, self.ui_q, self.log)
         self._pending_dev = dev
         keyterms = list(self._glossary.keys()) if self._glossary else None
-        threading.Thread(target=self._do_connect, args=(self._dg, src, keyterms), daemon=True).start()
+        allowed  = set(self._pair_codes())      # only trust in-pair auto-detect
+        threading.Thread(target=self._do_connect,
+                         args=(self._dg, src, keyterms, allowed), daemon=True).start()
 
-    def _do_connect(self, dg, src, keyterms=None):
-        ok = dg.connect(src_lang_name=src, keyterms=keyterms)
+    def _do_connect(self, dg, src, keyterms=None, allowed=None):
+        ok = dg.connect(src_lang_name=src, keyterms=keyterms, allowed=allowed)
         try: self.ui_q.put_nowait(("connect_result", ok))
         except: pass
 
@@ -2469,6 +2597,11 @@ class App:
 
         self.recording = True; self.session_start = time.time()
         self._last_audio_t = time.time(); self._audio_warn = False
+        self._gate = SpeechGate()
+        if SpeechGate._session is not None:
+            self.log.log("Smart pause ready (silence/hold music not billed)", "INFO")
+        elif SpeechGate._load_err:
+            self.log.log(f"Smart pause unavailable ({SpeechGate._load_err}), streaming everything", "WARN")
         # Open auto-save session cache (crash recovery — never lose a conversation)
         try:
             sp = Path.home() / ".interpro" / "sessions"
@@ -2498,9 +2631,14 @@ class App:
             "Could not connect to Deepgram.\n\nSee the Debug panel for the exact error.")
 
     def _stop(self):
+        saved = self._gate.saved_seconds() if self._gate else 0.0
+        self._gate = None
+        if saved >= 1:
+            self.log.log(f"Smart pause: {saved/60:.1f} min of silence/hold not billed", "INFO")
         if self.recording and self.session_start:
             m = self._usage_month()
             m["sec"] = m.get("sec", 0) + int(time.time() - self.session_start)
+            m["saved_sec"] = m.get("saved_sec", 0) + int(saved)
             self._save_settings(); self._usage_refresh()
         self.recording = False
         if self._cap: self._cap.stop(); self._cap = None
@@ -2529,20 +2667,47 @@ class App:
         self.live_dot.configure(text_color=MUT)
         self.live_confirmed.configure(text="")
         self.live_partial.configure(text="Waiting for speech…", text_color=TEXT)
-        self.live_tr.configure(text="")
+        self._overlay_speech("")
         self._set_meter(0, False)
         self._det_lbl.configure(
             text=f"Speak in {self.lang_a_var.get()} or {self.lang_b_var.get()}",
             text_color=DIM)
-        self.pipe_lbl.configure(text="Idle", text_color=DIM)
+        self.pipe_lbl.configure(
+            text=(f"Idle · {saved/60:.0f} min of silence/hold not billed this call"
+                  if saved >= 60 else "Idle"), text_color=DIM)
         self.hdr_status.configure(text="Ready", text_color=DIM)
 
     # ── Audio callbacks ──────────────────────────────────────────
     def _on_chunk(self, chunk):
         if self._privacy: return        # privacy pause — nothing leaves the app
-        if self._dg:
-            pcm = (chunk * 32767).astype(np.int16).tobytes()
-            self._dg.send_pcm(pcm)
+        dg = self._dg
+        if not dg: return
+        pcm = (chunk * 32767).astype(np.int16).tobytes()
+        gate = self._gate
+        if gate is None or not self._smart_pause:
+            dg.send_pcm(pcm); return
+        was = gate.open
+        for blob in gate.feed(chunk, pcm):
+            dg.send_pcm(blob)
+        if gate.open != was:
+            try: self.ui_q.put_nowait(("gate", gate.open))
+            except: pass
+
+    def _toggle_smart_pause(self):
+        self._smart_pause = bool(self.smart_pause_var.get())
+        self._settings["smart_pause"] = self._smart_pause
+        self._save_settings()
+        if self._gate:
+            self._gate.reset()            # resume streaming right away
+        if self.recording:
+            self._show_gate(True)
+
+    def _show_gate(self, is_open):
+        if is_open:
+            self.pipe_lbl.configure(text="✓ Streaming to Deepgram", text_color=GREEN)
+        else:
+            self.pipe_lbl.configure(text="⏸ No one talking: audio paused (not billed)",
+                                    text_color=DIM)
 
     def _on_level(self, lvl, spk, bcap):
         try: self.ui_q.put_nowait(("level", lvl, spk, bcap))
@@ -2576,17 +2741,17 @@ class App:
                     if ok: self._finish_start()
                     else:  self._connect_failed()
                 elif k == "phrase":
+                    if self._gate and getattr(item[1], "text", "").strip():
+                        self._gate.touch()
                     self._handle(item[1])
+                elif k == "gate":
+                    if self.recording and self._smart_pause:
+                        self._show_gate(item[1])
                 elif k == "flush_para":
                     if len(item) > 1 and item[1] == "immediate":
                         self._para_flush()   # speaker change — no grace delay
                     else:
                         self._maybe_flush()  # UtteranceEnd — smart boundary
-                elif k == "live_tr":
-                    # Fast Google translation result for the live overlay
-                    if self.show_tr.get():
-                        self.live_tr.configure(text=item[1], text_color=TEXT)
-                        self._overlay_live(item[1])
                 elif k == "ws_status":
                     _, st, msg = item
                     c = {"connected":GREEN,"warn":YELLOW,"error":RED}.get(st, DIM)
@@ -2684,7 +2849,7 @@ class App:
     def _handle(self, p: Phrase):
         """Route incoming Deepgram phrase to the right track.
 
-        PARTIAL  → confirmed buffer (white) + current partial (gray ▋); async Google for live_tr
+        PARTIAL  → confirmed buffer (white) + current partial (gray ▋)
         FINAL    → commit text to paragraph buffer; confirmed label updates, partial clears
         """
         # ── Confidence / language indicator ─────────────────────
@@ -2707,18 +2872,7 @@ class App:
             self.live_confirmed.configure(text=buf)
             self.live_partial.configure(text=p.text + "  ▋", text_color=DIM)
 
-            # ── Kick off async Google for live translation ───────
-            if self.show_tr.get() and live_text and not self._live_tr_busy:
-                self._live_tr_busy = True
-                self._live_tr_ver += 1
-                ver = self._live_tr_ver
-                src = DG_TO_TRANS.get(p.lang, "en")
-                tgt = self._target_for(src)
-                threading.Thread(
-                    target=self._async_live_tr,
-                    args=(live_text, src, tgt, ver),
-                    daemon=True
-                ).start()
+            self._overlay_speech(live_text)
         else:
             # ── Final: split into sentences, add each separately ──
             # This prevents multi-sentence Deepgram finals from mixing
@@ -2741,28 +2895,7 @@ class App:
             # Show whatever remains in the buffer (incomplete sentence)
             self.live_confirmed.configure(text=buf if buf else "")
             self.live_partial.configure(text="")
-
-            # ── Refresh live_tr to translate full buffer ─────────
-            if self.show_tr.get() and buf and not self._live_tr_busy:
-                self._live_tr_busy = True
-                self._live_tr_ver += 1
-                ver = self._live_tr_ver
-                src = DG_TO_TRANS.get(p.lang, "en")
-                tgt = self._target_for(src)
-                threading.Thread(
-                    target=self._async_live_tr,
-                    args=(buf, src, tgt, ver),
-                    daemon=True
-                ).start()
-
-    def _async_live_tr(self, text: str, src: str, tgt: str, ver: int):
-        """Background thread: Google-translate `text` and post result to UI queue.
-        If a newer request started while we were busy, discard this result."""
-        tr = self.translator.google_translate(text, src, tgt)
-        self._live_tr_busy = False
-        if tr and ver == self._live_tr_ver:
-            try: self.ui_q.put_nowait(("live_tr", tr))
-            except: pass
+            self._overlay_speech(buf)
 
     # ══════════════════════════════════════════════════════════════
     # Paragraph buffer (accumulates finals until flush trigger)
@@ -2921,7 +3054,7 @@ class App:
         # Clear the LIVE workspace instantly
         self.live_confirmed.configure(text="")
         self.live_partial.configure(text="", text_color=DIM)
-        self.live_tr.configure(text="")
+        self._overlay_speech("")
 
         # ── Create the bubble slot RIGHT NOW on the main thread ──
         # This locks in display order regardless of when Claude finishes.
@@ -3068,36 +3201,12 @@ class App:
         # ── Translation memory: exact repeats are free & instant ──
         cached = self.tm.lookup(text, src, tgt, domain)
         if cached:
-            tr, engine, use_claude = cached, "cached", False
+            tr, engine = cached, "cached"
         else:
-            # ── Cost-aware engine routing ─────────────────────────
-            mode = self.quality_var.get()
-            use_claude = self.translator._claude is not None
-            if mode.startswith("Economy"):
-                use_claude = False
-            elif mode.startswith("Balanced") and use_claude:
-                use_claude = self._needs_claude(text, conf, domain)
-
-        if cached:
-            pass
-        elif use_claude:
-            context  = list(self._context_window)
-            summary  = self._conversation_summary
-            glossary = dict(self._glossary)
-            tr, engine = self.translator.claude_translate(text, src, tgt, conf,
-                                                  context=context, domain=domain,
-                                                  summary=summary, glossary=glossary)
-        else:
-            g = self.translator.google_translate(text, src, tgt)
-            if not g and self.translator._claude:
-                # Google (unofficial scraper) failed — rescue with Claude so
-                # the bubble never shows a bare "—".
-                g, _eng = self.translator.claude_translate(text, src, tgt, conf,
-                                                           domain=domain)
-                self.log.log("Google failed -> Claude rescue", "WARN")
-                tr, engine = g, ("claude" if g else "none")
-            else:
-                tr, engine = g, ("google" if g else "none")
+            tr, engine = self.translator.claude_translate(
+                text, src, tgt, conf,
+                context=list(self._context_window), domain=domain,
+                summary=self._conversation_summary, glossary=dict(self._glossary))
         if engine == "claude":
             try: self._usage_month()["claude"] += 1
             except Exception: pass
@@ -3141,15 +3250,13 @@ class App:
 
         self._overlay_last(tr)
 
-        # Engine chip: Claude = purple check, Google = dim fallback marker
+        # Engine chip: Claude = purple check, memory hit = instant
         if eng_lbl is not None:
             try:
                 if engine == "claude":
                     eng_lbl.configure(text="Claude ✓", text_color=PURPLE)
                 elif engine == "cached":
                     eng_lbl.configure(text="⚡ Instant", text_color=GREEN)
-                elif engine == "google":
-                    eng_lbl.configure(text="Google", text_color=DIM)
             except Exception:
                 pass
 
@@ -3189,22 +3296,6 @@ class App:
         self._refill_job = None
         self._rebuild()
 
-    def _needs_claude(self, text: str, conf: float, domain: str) -> bool:
-        """Balanced mode: route to Claude only when quality actually matters.
-        Google handles short, clear, everyday sentences for free."""
-        if domain in ("Legal", "Medical"):
-            return True                      # strict domains always get Claude
-        if conf < 0.80:
-            return True                      # muffled audio needs cleanup/inference
-        if any(c.isdigit() for c in text):
-            return True                      # numbers, money, phones, addresses
-        if len(text.split()) >= 12:
-            return True                      # long sentences → idioms/complexity
-        tl = text.lower()
-        if any(term.lower() in tl for term in self._glossary):
-            return True                      # glossary terms need the rules applied
-        return False
-
     # ── Text cleanup ─────────────────────────────────────────────
     @staticmethod
     def _clean_text(text: str, domain: str = "Auto") -> str:
@@ -3228,9 +3319,8 @@ class App:
 
     def _maybe_summarize(self):
         """Kick off a background summary of the full session so far.
-        Called every 8 bubbles. Skipped if already summarizing or no Claude key."""
+        Called every 20 bubbles. Skipped if already summarizing or no Claude key."""
         if self._summarizing or not self.translator._claude: return
-        if self.quality_var.get().startswith("Economy"): return  # no Claude spend
         self._summarizing = True
         bubbles = list(self.committed.values())
         threading.Thread(
@@ -3322,7 +3412,6 @@ class App:
             narrow    = avail < 780
             self.live_confirmed.configure(wraplength=live_wrap)
             self.live_partial.configure(wraplength=live_wrap)
-            self.live_tr.configure(wraplength=live_wrap)
             changed = (abs(new_wrap - self._wrap) > 50
                        or abs(col_wrap - getattr(self, "_col_wrap", 0)) > 50
                        or narrow != self._narrow)
@@ -3511,7 +3600,6 @@ class App:
         try:
             self.live_confirmed.configure(font=(F, 12+fs))
             self.live_partial.configure(font=(F, 12+fs))
-            self.live_tr.configure(font=(F, 21+fs, "bold"))
         except Exception: pass
         self._rebuild()
         self._save_settings()
@@ -3619,16 +3707,16 @@ class App:
         ov.protocol("WM_DELETE_WINDOW", _closed)
         self._overlay = ov
 
-    def _overlay_live(self, text):
+    def _overlay_speech(self, text):
+        """Overlay small line: what's being said right now (transcript)."""
         if getattr(self, "_overlay", None):
-            try: self.ov_live.configure(text=text)
+            try: self.ov_last.configure(text=text)
             except Exception: pass
 
     def _overlay_last(self, text):
+        """Overlay big text: the latest finished translation."""
         if getattr(self, "_overlay", None):
-            try:
-                self.ov_last.configure(text=text)
-                self.ov_live.configure(text="")
+            try: self.ov_live.configure(text=text)
             except Exception: pass
 
     # ══════════════════════════════════════════════════════════════
@@ -3668,12 +3756,12 @@ class App:
             placeholder_text="Paste your Deepgram key here…").pack(fill="x")
 
         # STEP 2 — Claude key
-        sec("STEP 2 — Claude API key (optional, recommended)",
-            "Upgrades translation quality for numbers, idioms and difficult audio. Get one at console.anthropic.com. Without it, everything still works using Google.")
+        sec("STEP 2 — Claude API key (required for translation)",
+            "Sayvo uses Claude to translate. Get a key at console.anthropic.com. Without it, Sayvo only transcribes.")
         ctk.CTkEntry(body, textvariable=self.anthropic_key_var, show="●",
             fg_color=BG3, text_color=TEXT, border_width=0, font=(F,10),
             corner_radius=8, height=36,
-            placeholder_text="Paste your Anthropic key here (or leave empty)…").pack(fill="x")
+            placeholder_text="Paste your Anthropic key here…").pack(fill="x")
 
         # STEP 3 — Audio source + test
         sec("STEP 3 — Where is your call audio?",
@@ -3792,8 +3880,8 @@ class App:
         key_row("DEEPGRAM API KEY  (required — speech to text)",
                 "Get a free key at console.deepgram.com",
                 self.api_key_var, self._save_key, ACCENT)
-        key_row("CLAUDE API KEY  (optional — best translation quality)",
-                "console.anthropic.com — without it Sayvo uses Google only",
+        key_row("CLAUDE API KEY  (required — translation)",
+                "console.anthropic.com — without it Sayvo only transcribes",
                 self.anthropic_key_var, self._save_anthropic_key, PURPLE)
 
         ctk.CTkButton(win, text="🧙  Run Setup Wizard again",
@@ -4171,7 +4259,7 @@ class App:
         self.sv_lang.configure(text="—")
         self.live_confirmed.configure(text="")
         self.live_partial.configure(text="Waiting for speech…", text_color=TEXT)
-        self.live_tr.configure(text="")
+        self._overlay_speech("")
         if self.recording:
             self.session_start = time.time(); self.sv_time.configure(text="0:00")
 
@@ -4206,9 +4294,20 @@ class App:
 
 # ── Entry ────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        # Build check, no UI: can this exe load the smart-pause model?
+        SpeechGate.preload()
+        ok = SpeechGate._session is not None
+        if ok:
+            g = SpeechGate()
+            ok = g._speech_in(np.zeros(1600, np.float32)) is False and not g.failed
+        out = Path.home() / ".interpro" / "selftest.txt"
+        out.write_text(f"v{__version__} smart_pause={'OK' if ok else 'FAIL'} "
+                       f"{SpeechGate._load_err or ''}", encoding="utf-8")
+        sys.exit(0 if ok else 1)
     missing = []
     for pkg, pip in [("sounddevice","sounddevice"), ("numpy","numpy"),
-                     ("websocket","websocket-client"), ("deep_translator","deep-translator"),
+                     ("websocket","websocket-client"),
                      ("customtkinter","customtkinter")]:
         try: __import__(pkg)
         except: missing.append(pip)
