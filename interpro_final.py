@@ -5,7 +5,7 @@ Sayvo — Professional Real-Time Interpreter Tool
   LIVE zone   — what's being said right now (Deepgram transcript)
   Bubble zone — each finished paragraph + its Claude (claude-haiku-4-5) translation
 """
-__version__ = "43"
+__version__ = "44"
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import tkinter.font as tkfont
@@ -503,20 +503,50 @@ def find_working_sr(dev_idx, log):
     return int(sd.query_devices(dev_idx)["default_samplerate"])
 
 class Resampler:
+    """Streaming polyphase resampler (numpy only): device rate -> 16 kHz.
+
+    Replaces scipy.signal.resample_poly. Importing scipy took ~10 s on a cold
+    start and froze the window on the first Start of every launch, and it
+    added ~70 MB to the build. Same filter design as resample_poly
+    (Kaiser-windowed sinc, beta 5, half-length 10*max(up, down)), but the
+    filter state carries across chunks, so there are no seams at chunk
+    edges (per-chunk resample_poly zero-padded every block boundary)."""
     def __init__(self, src, dst=TARGET_SR):
-        self.ratio = dst/src; self._scipy = False
-        if src != dst:
-            try:
-                from scipy.signal import resample_poly
-                import math; g = math.gcd(dst, src)
-                self._up=dst//g; self._dn=src//g; self._poly=resample_poly; self._scipy=True
-            except: pass
+        import math
+        src, dst = int(src), int(dst)
+        g = math.gcd(dst, src)
+        self.L, self.M = dst // g, src // g          # up, down
+        self.ratio = dst / src
+        if self.L == self.M:
+            return
+        R = max(self.L, self.M); half = 10 * R
+        n = np.arange(-half, half + 1, dtype=np.float64)
+        h = np.sinc(n / R) * np.kaiser(2 * half + 1, 5.0)
+        h *= self.L / h.sum()                        # unity gain after zero-stuffing
+        K = -(-len(h) // self.L)                     # taps per phase
+        hp = np.zeros((self.L, K))
+        for p in range(self.L):
+            taps = h[p::self.L]; hp[p, :len(taps)] = taps
+        self._hp, self._K = hp.astype(np.float32), K
+        self._hist = np.zeros(K - 1, np.float32)     # last K-1 input samples
+        self._n_in = 0                               # input samples consumed
+        self._k = 0                                  # next output sample index
 
     def run(self, audio):
-        if self.ratio == 1.0: return audio
-        if self._scipy: return self._poly(audio,self._up,self._dn).astype(np.float32)
-        n = max(1, int(len(audio)*self.ratio))
-        return np.interp(np.linspace(0,len(audio)-1,n),np.arange(len(audio)),audio).astype(np.float32)
+        if self.L == self.M:
+            return audio
+        x = np.concatenate([self._hist, np.asarray(audio, np.float32)])
+        base = self._n_in - len(self._hist)          # stream index of x[0]
+        self._n_in += len(audio)
+        k_end = -(-(self._n_in * self.L) // self.M)  # outputs whose input exists
+        ks = np.arange(self._k, k_end, dtype=np.int64)
+        self._k = k_end
+        self._hist = x[len(x) - (self._K - 1):]
+        if len(ks) == 0:
+            return np.zeros(0, np.float32)
+        m = ks * self.M
+        idx = (m // self.L - base)[:, None] - np.arange(self._K)[None, :]
+        return np.einsum("ij,ij->i", x[idx], self._hp[m % self.L]).astype(np.float32)
 
 # ── Translator ───────────────────────────────────────────────────
 _CLAUDE_SYS = """\
@@ -1297,6 +1327,12 @@ class DeepgramStream:
                 try: self.ui_q.put_nowait(("phrase", p))
                 except: pass
 
+            if is_final and data.get("speech_final"):
+                # endpoint: the speaker just stopped (~0.5 s). Queued AFTER
+                # the phrase, so the buffer already holds this text.
+                try: self.ui_q.put_nowait(("flush_para", "endpoint"))
+                except: pass
+
             try: self.ui_q.put_nowait(("ws_bytes", self._bytes_sent))
             except: pass
 
@@ -1560,8 +1596,8 @@ class App:
     # UtteranceEnd (1 s) is the primary flush trigger.
     # The safety timer fires if UtteranceEnd is never sent
     # (e.g. very long continuous speech).
-    PARA_SAFETY_SEC = 3.0   # pause flush when the buffer is a complete sentence
-    PARA_EXTEND_SEC = 4.0   # extra grace when it ends mid-thought (comma etc.)
+    PARA_SAFETY_SEC = 2.0   # pause flush if Deepgram's UtteranceEnd never came
+    PARA_EXTEND_SEC = 3.0   # extra grace when it ends mid-thought (comma etc.)
     PARA_MAX_WORDS  = 90    # hard word cap → force flush
 
     def __init__(self):
@@ -2750,8 +2786,10 @@ class App:
                 elif k == "flush_para":
                     if len(item) > 1 and item[1] == "immediate":
                         self._para_flush()   # speaker change — no grace delay
+                    elif len(item) > 1 and item[1] == "endpoint":
+                        self._maybe_flush(endpoint=True)   # ~0.5 s pause
                     else:
-                        self._maybe_flush()  # UtteranceEnd — smart boundary
+                        self._maybe_flush()  # UtteranceEnd (~1 s) — smart boundary
                 elif k == "ws_status":
                     _, st, msg = item
                     c = {"connected":GREEN,"warn":YELLOW,"error":RED}.get(st, DIM)
@@ -2990,17 +3028,21 @@ class App:
     # ══════════════════════════════════════════════════════════════
     # TRACK 2 — Smart flush → Claude → Bubble
     # ══════════════════════════════════════════════════════════════
-    def _maybe_flush(self):
-        """Smart flush — called on UtteranceEnd (1 s of silence).
+    def _maybe_flush(self, endpoint=False):
+        """Smart flush on a pause in speech.
 
-        A 1-second breath is NOT the end of a thought. Only flush here when
-        the paragraph is already substantial; otherwise keep accumulating —
-        the 3 s safety timer is the real "speaker finished" signal.
+        endpoint=True  : Deepgram speech_final, ~0.5 s of silence
+        endpoint=False : Deepgram UtteranceEnd, ~1 s of silence
 
-        Rules (in priority order):
-        1. Complete sentence AND >= 25 words → solid paragraph → flush.
-        2. >= 60 words even without punctuation → runaway → flush.
-        3. Otherwise → keep accumulating (safety timer flushes real pauses).
+        Rules (v44 — user wanted short questions/answers to land fast):
+        1. A question ("...?") flushes at the first 0.5 s pause: the other
+           person is now waiting for an answer.
+        2. Any complete sentence (. ! ? …) flushes after 1 s of silence.
+           Breaths shorter than that never reach here, so continuous talk
+           still groups into one paragraph.
+        3. >= 60 words even without punctuation → runaway → flush.
+        4. Otherwise (mid-thought, e.g. ends on a comma) → keep building;
+           the safety timer flushes it (2 s, +3 s grace).
         """
         if self._grace_timer:
             self.root.after_cancel(self._grace_timer)
@@ -3009,10 +3051,13 @@ class App:
             text = self._para_text.strip()
         if not text:
             return
-        words = len(text.split())
-        if (text[-1] in '.!?…' and words >= 25) or words >= 60:
+        if endpoint:
+            if text[-1] == '?':
+                self._para_flush()
+            return
+        if text[-1] in '.!?…' or len(text.split()) >= 60:
             self._para_flush()
-        # else: keep building the paragraph
+        # else: mid-thought, keep building the paragraph
 
     def _grace_flush(self):
         """Fires 350 ms after a mid-length non-punctuated UtteranceEnd."""
@@ -4301,8 +4346,18 @@ if __name__ == "__main__":
         if ok:
             g = SpeechGate()
             ok = g._speech_in(np.zeros(1600, np.float32)) is False and not g.failed
+        rs_ok = False
+        try:
+            rs = Resampler(48000)
+            t = np.arange(48000) / 48000.0
+            y = np.concatenate([rs.run(c) for c in np.array_split(
+                (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32), 100)])
+            rs_ok = abs(len(y) - 16000) <= 1 and 0.45 < float(np.abs(y[2000:]).max()) < 0.55
+        except Exception:
+            pass
+        ok = ok and rs_ok
         out = Path.home() / ".interpro" / "selftest.txt"
-        out.write_text(f"v{__version__} smart_pause={'OK' if ok else 'FAIL'} "
+        out.write_text(f"v{__version__} smart_pause+resampler={'OK' if ok else 'FAIL'} "
                        f"{SpeechGate._load_err or ''}", encoding="utf-8")
         sys.exit(0 if ok else 1)
     missing = []

@@ -28,6 +28,7 @@ build_env\Scripts\pyinstaller ^
   --hidden-import pyaudiowpatch ^
   --hidden-import keyboard ^
   --hidden-import onnxruntime ^
+  --exclude-module scipy ^
   --collect-all customtkinter ^
   interpro_final.py
 
